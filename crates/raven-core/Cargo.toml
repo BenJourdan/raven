@@ -1,0 +1,9 @@
+[package]
+name = "raven-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustc-hash = "2.1.2"
+tokio = { version = "1.51.1", features = ["sync"] }
+typed_floats = "1.0.7"

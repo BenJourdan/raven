@@ -1,0 +1,8 @@
+[package]
+name = "raven"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+raven-core.workspace = true
+raven-adapters.workspace = true

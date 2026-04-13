@@ -1,0 +1,15 @@
+[workspace]
+members = [
+  "crates/raven-core",
+  "crates/raven-adapters",
+  "crates/raven",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+raven-core = { path = "crates/raven-core" }
+raven-adapters = { path = "crates/raven-adapters" }
