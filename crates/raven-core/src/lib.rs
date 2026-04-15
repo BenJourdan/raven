@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use typed_floats::StrictlyPositiveFinite;
 
-mod common;
+mod float_newtypes;
+mod int_newtypes;
 
 
 /// Struct to hold the operations 
