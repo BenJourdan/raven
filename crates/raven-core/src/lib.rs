@@ -1,81 +1,90 @@
-
-use tokio::sync::mpsc::{Sender, Receiver};
 use std::sync::Arc;
 
-use typed_floats::StrictlyPositiveFinite;
 
-mod float_newtypes;
-mod int_newtypes;
+pub mod types;
+pub mod alg;
+pub mod error;
 
+use types::{
+    PartitionType,
+    PartitionOutput
+};
 
-/// Struct to hold the operations 
-#[derive(PartialEq, PartialOrd, Debug)]
-pub struct NodeOps<V, T> {
-    pub created: (Vec<V>, Vec<T>),
-    pub modified: (Vec<V>, Vec<T>),
-    pub deleted: (Vec<V>, Vec<T>),
-}
-
-
-impl <V, T> NodeOps<V, T> 
-    where StrictlyPositiveFinite: From<T>
+/// A helper type for the neighbour oracle function.
+/// Given a batch of node identifies, return a slice of
+/// their neighbours and the corresponding edge weights.
+trait GraphBatchNeighbours<V, S, E>:
+    for<'a>  Fn(&'a [V]) -> Result<&'a[&'a[(V, S)]], error::OracleError<E>>
 {
-
+    
+}
+/// Implement the trait for any function that matches the signature.
+impl <F, V, S, E> GraphBatchNeighbours<V, S, E> for F
+where
+    F: for<'a> Fn(&'a [V]) -> Result<&'a[&'a[(V, S)]], error::OracleError<E>>
+{   
 }
 
-pub trait Adapter{
-    type V : Clone + PartialEq + PartialOrd + std::fmt::Debug;
-    type T : Clone + PartialEq + PartialOrd + std::fmt::Debug;
+// In future, it should be possible to do the above with a trait alias:
+// type GraphBatchNeighbours<V, S, E> = for<'a> Fn(&'a [V]) -> Result<&'a[&'a[(V, S)]], error::OracleError<E>>;
 
-    fn update(&self, ops: NodeOps<Self::V, Self::T>) -> ();
-    fn query(&self, query: &[Self::V]) -> Vec<Self::V>;
-    fn graph_oracle_query(&self, query: &[Self::V]) -> Vec<Vec<(Self::V, Self::T)>>;
-}
-
-pub struct DynamicClustering< const ARITY: usize, V, T>{
-    // Map stable unique node Ids to tree indices
-    pub node_to_tree_map: FxHashMap<V, TreeIndex>,
-    // and the reverse map:
-    pub tree_to_node_map: FxHashMap<TreeIndex, V>,
-
-    // degree priority queue
-    pub degrees: PriorityQueue<V, NodeDegree>,
-
-    // struct to hold tree data
-    pub tree_data: TreeData<ARITY>,
-
-    // sigma shift to set
-    pub sigma: Float,
-
-    // For lazy query time updates
-    pub timestamp: usize,
-
-    pub update_set: FxHashSet<TreeIndex>,
-
-    pub coreset_size: usize,
-    pub sampling_seeds: usize,
-
-    pub num_clusters: usize,
-    pub cluster_alg: AlgType,
-    pub prop_name: String,
-}
-
-pub struct Engine<A, C> {
-    adapter: A,
-    core: C,
-}
-
-impl <A, C> Engine<A, C>
-    where A: Adapter<V = String, T = f64>,
+/// A helper type for the coreset neighbour oracle function.
+/// Given a batch of node identifies in the coreset,
+/// return a slice of their neighbours in the coreset
+/// and the corresponding edge weights.
+/// This ignores any edges to nodes outside the coreset.
+trait CoresetNeighbours<V, S, E>:
+    for<'a>  Fn(&'a [V]) -> Result<&'a[&'a[(V, S)]], error::OracleError<E>>
 {
-
 }
+/// Implement the trait for any function that matches the signature.
+impl <F, V, S, E> CoresetNeighbours<V, S, E> for F
+where
+    F: for<'a> Fn(&'a [V]) -> Result<&'a[&'a[(V, S)]], error::OracleError<E>>
+{
+} 
 
+
+/// A trait for dynamic clustering algorithms.
+pub trait DynamicClusteringAlg<V,S> {
+    /// Apply a batch of node updates to the data structure.
+    fn apply_node_ops<G, E>(
+        &mut self, 
+        diffs: &[(V, Option<S>)], 
+        graph_oracle: &G) -> ()
+    where
+        G: GraphBatchNeighbours<V, S, E> + ?Sized; // ?Sized allows for dynamically sized types.
+
+    /// Query the current clustering with a partition type.
+    fn query<G, C, E>(
+        &mut self,
+        partition: PartitionType<V>,
+        graph_oracle: &G,
+        coreset_oracle: &C,
+    ) -> PartitionOutput<V>
+    where
+        G: GraphBatchNeighbours<V, S, E> + ?Sized,
+        C: CoresetNeighbours<V, S, E> + ?Sized;
+}
 
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn imports_work(){
+        alg::TreeData::<4, types::Strict<f64>>{
+                timestamp: vec![],
+                volume: vec![],
+                size: vec![],
+                f_delta: vec![],
+                h_b: vec![],
+                h_s: vec![],
+        };
+
+        let x = types::Strict::<f64>::new(1.0).unwrap();
+        let y: Option<types::Strict<f64>> = Some(x);
+    }
 
 }
