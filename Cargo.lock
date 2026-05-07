@@ -1099,6 +1099,7 @@ dependencies = [
  "num-traits",
  "priority-queue",
  "rand 0.10.1",
+ "rayon",
  "rustc-hash",
  "tokio",
  "typed_floats",

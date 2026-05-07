@@ -1,9 +1,6 @@
-use std::num::NonZeroUsize;
+use std::{fmt, hash::Hash, num::NonZeroUsize};
 
-use crate::error::ReciprocalOverflow;
-
-use super::{NonStrict, NonStrictBounds, Positive, Strict, StrictBounds};
-
+use super::{NonStrict, Strict};
 
 #[derive(Debug, Clone, Copy)]
 pub enum InvalidNumber {
@@ -40,19 +37,16 @@ impl From<typed_floats::InvalidNumber> for InvalidNumber {
     }
 }
 
-
-/// Operations that are valid for the strict positive finite carrier family.
-pub trait StrictCarrierOps: StrictBounds + Sized {
+/// Operations and standard bounds for the strict positive finite carrier family.
+pub trait StrictCarrierOps: Ord + Hash + fmt::Display + Sized {
     type Scalar;
 
     fn from_positive_scalar(x: Self::Scalar) -> Result<Self, InvalidNumber>;
     /// SAFETY: The caller must ensure that `x` is a valid positive finite number.
-    unsafe fn from_positive_scalar_unchecked(x: Self:: Scalar) -> Self;
+    unsafe fn from_positive_scalar_unchecked(x: Self::Scalar) -> Self;
     fn into_scalar(self) -> Self::Scalar;
     fn from_non_zero_usize(x: NonZeroUsize) -> Self;
-    fn recip(self) -> Positive<Self::Scalar>;
-    fn try_recip_finite(self) -> Result<Self, ReciprocalOverflow>;
-    unsafe fn recip_finite_unchecked(self) -> Self;
+    fn one() -> Self;
 }
 
 macro_rules! impl_strict_carrier_ops {
@@ -60,13 +54,13 @@ macro_rules! impl_strict_carrier_ops {
         $(
             impl StrictCarrierOps for Strict<$t> {
                 type Scalar = $t;
-                
+
                 fn from_positive_scalar(x: Self::Scalar) -> Result<Self, InvalidNumber> {
                     Strict::<$t>::new(x).map_err(|e| e.into())
                 }
 
                 unsafe fn from_positive_scalar_unchecked(x: Self::Scalar) -> Self {
-                
+
                     #[cfg(debug_assertions)]
                     {
                         Strict::<$t>::new(x).expect("Invalid number passed to from_positive_scalar_unchecked")
@@ -88,24 +82,8 @@ macro_rules! impl_strict_carrier_ops {
                     unsafe { Strict::<$t>::new_unchecked(val) }
                 }
 
-                fn recip(self) -> Positive<$t> {
-                    let y = (1.0 as $t) / self.get();
-                    unsafe { Positive::<$t>::new_unchecked(y) }
-                }
-
-                fn try_recip_finite(self) -> Result<Self, ReciprocalOverflow> {
-                    let y = (1.0 as $t) / self.get();
-                    if y.is_finite() {
-                        Ok(unsafe { Strict::<$t>::new_unchecked(y) })
-                    } else {
-                        Err(ReciprocalOverflow)
-                    }
-                }
-
-                unsafe fn recip_finite_unchecked(self) -> Self {
-                    let y = (1.0 as $t) / self.get();
-                    debug_assert!(y.is_finite());
-                    unsafe { Strict::<$t>::new_unchecked(y) }
+                fn one() -> Self {
+                    unsafe { Strict::<$t>::new_unchecked(1.0) }
                 }
             }
         )*
@@ -114,13 +92,13 @@ macro_rules! impl_strict_carrier_ops {
 
 impl_strict_carrier_ops!(f32, f64);
 
-/// Operations that are valid for the non-strict positive finite carrier family.
-pub trait NonStrictCarrierOps: NonStrictBounds + Sized {
+/// Operations and standard bounds for the non-strict positive finite carrier family.
+pub trait NonStrictCarrierOps: Ord + Hash + fmt::Display + Sized {
     type Scalar;
 
-    fn from_positive_scalar(x: Self::Scalar) -> Result<Self, InvalidNumber>;
+    fn from_non_negative_scalar(x: Self::Scalar) -> Result<Self, InvalidNumber>;
     /// SAFETY: The caller must ensure that `x` is a valid non-negative finite number.
-    unsafe fn from_positive_scalar_unchecked(x: Self:: Scalar) -> Self;
+    unsafe fn from_non_negative_scalar_unchecked(x: Self::Scalar) -> Self;
     fn into_scalar(self) -> Self::Scalar;
     fn zero() -> Self;
     fn from_usize(x: usize) -> Self;
@@ -132,14 +110,14 @@ macro_rules! impl_non_strict_carrier_ops {
             impl NonStrictCarrierOps for NonStrict<$t> {
                 type Scalar = $t;
 
-                fn from_positive_scalar(x: Self::Scalar) -> Result<Self, InvalidNumber> {
+                fn from_non_negative_scalar(x: Self::Scalar) -> Result<Self, InvalidNumber> {
                     NonStrict::<$t>::new(x).map_err(|e| e.into())
                 }
 
-                unsafe fn from_positive_scalar_unchecked(x: Self::Scalar) -> Self {
+                unsafe fn from_non_negative_scalar_unchecked(x: Self::Scalar) -> Self {
                     #[cfg(debug_assertions)]
                     {
-                        NonStrict::<$t>::new(x).expect("Invalid number passed to from_positive_scalar_unchecked")
+                        NonStrict::<$t>::new(x).expect("Invalid number passed to from_non_negative_scalar_unchecked")
                     }
                     #[cfg(not(debug_assertions))]
                     {

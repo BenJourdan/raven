@@ -1,15 +1,14 @@
+pub mod alg;
 pub mod float;
 pub mod int;
 pub mod pow2;
-pub mod alg;
 
+pub use alg::*;
 pub use float::*;
 pub use int::*;
 pub use pow2::*;
-pub use alg::*;
 
-
-/// Specify whether the query is for all 
+/// Specify whether the query is for all
 /// nodes, or just a subset of nodes.
 pub enum PartitionType<'a, V> {
     All,

@@ -1,24 +1,21 @@
 use std::fmt;
 
-
-
 /// Error types for dynamic coreset operations and oracles.
 #[derive(Debug)]
-pub enum AlgorithmicError<E>{
+pub enum AlgorithmicError<E> {
     OracleError(E),
     DataStructureError(DynamicCoresetError),
 }
 
-
 #[derive(Debug)]
-pub enum OracleError<E>{
+pub enum OracleError<E> {
     GraphError(E),
     CoresetError(E),
 }
 
-impl <E> fmt::Display for OracleError<E> 
+impl<E> fmt::Display for OracleError<E>
 where
-    E: fmt::Display
+    E: fmt::Display,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -37,7 +34,6 @@ pub enum DynamicCoresetError {
     NodeAlreadyExists(String),
     NoSelfLoopsAllowed(String),
 }
-
 
 /// Returned when the reciprocal of a finite positive value overflows to `+inf`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,8 +54,6 @@ impl fmt::Display for DynamicCoresetError {
         }
     }
 }
-
-
 
 impl std::error::Error for DynamicCoresetError {}
 impl std::error::Error for ReciprocalOverflow {}

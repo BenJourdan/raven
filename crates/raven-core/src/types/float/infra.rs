@@ -46,20 +46,3 @@ where
     assert_eq!(align_of::<T>(), align_of::<U>());
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const U, s.len()) }
 }
-
-/// Shared plumbing for semantic wrappers over typed float carriers.
-pub trait WrapsCarrierFloat {
-    type Inner;
-
-    fn into_float(self) -> Self::Inner;
-    fn from_float(x: Self::Inner) -> Self;
-}
-
-/// Convert between wrappers that share the same carrier type.
-pub fn convert<T, U>(x: T) -> U
-where
-    T: WrapsCarrierFloat,
-    U: WrapsCarrierFloat<Inner = T::Inner>,
-{
-    U::from_float(x.into_float())
-}

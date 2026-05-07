@@ -10,19 +10,19 @@
 //
 // use crate::{
 //     types::float::{
-//         NonStrict, NonStrictBounds, NonStrictCarrierOps, Positive, Strict, StrictBounds,
-//         StrictCarrierOps, TransparentOver, WrapsCarrierFloat,
+//         FloatScalar, InvalidNumber, NonStrict, NonStrictCarrierOps, Positive,
+//         Strict, StrictCarrierOps, TransparentOver,
 //     },
 //     error::ReciprocalOverflow,
 // };
 
 macro_rules! impl_wrapper_common {
-    ($name:ident, $carrier:ident, $bounds:ident) => {
+    ($name:ident, $carrier:ident, $carrier_ops:ident) => {
         #[repr(transparent)]
         #[derive(Copy, Clone)]
         pub struct $name<T>(pub $carrier<T>);
         // where
-        //     $carrier<T>: $bounds;
+        //     $carrier<T>: $carrier_ops<Scalar = T>;
 
         impl<T> Debug for $name<T>
         where
@@ -76,29 +76,14 @@ macro_rules! impl_wrapper_common {
 
         unsafe impl<T> TransparentOver for $name<T>
         where
-            $carrier<T>: $bounds,
+            $carrier<T>: $carrier_ops<Scalar = T>,
         {
             type Inner = $carrier<T>;
-        }
-
-        impl<T> WrapsCarrierFloat for $name<T>
-        where
-            $carrier<T>: $bounds,
-        {
-            type Inner = $carrier<T>;
-
-            fn into_float(self) -> Self::Inner {
-                self.0
-            }
-
-            fn from_float(x: Self::Inner) -> Self {
-                Self(x)
-            }
         }
 
         impl<T> From<$carrier<T>> for $name<T>
         where
-            $carrier<T>: $bounds,
+            $carrier<T>: $carrier_ops<Scalar = T>,
         {
             fn from(x: $carrier<T>) -> Self {
                 Self(x)
@@ -107,54 +92,54 @@ macro_rules! impl_wrapper_common {
 
         impl<T> $name<T>
         where
-            $carrier<T>: $bounds,
+            $carrier<T>: $carrier_ops<Scalar = T>,
         {
             pub fn new(x: $carrier<T>) -> Self {
                 Self(x)
+            }
+
+            pub fn into_scalar(self) -> T {
+                <$carrier<T> as $carrier_ops>::into_scalar(self.0)
             }
         }
 
         impl<T> Display for $name<T>
         where
-            $carrier<T>: $bounds,
+            $carrier<T>: $carrier_ops<Scalar = T>,
         {
             fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
                 write!(f, "{}", self.0)
             }
         }
-
-
     };
 }
 
 macro_rules! newtypes_strict {
     ($($name:ident),* $(,)?) => {
         $(
-            crate::types::float::macros::impl_wrapper_common!($name, Strict, StrictBounds);
+            crate::types::float::macros::impl_wrapper_common!(
+                $name,
+                Strict,
+                StrictCarrierOps
+            );
 
             impl<T> $name<T>
             where
                 Strict<T>: StrictCarrierOps<Scalar = T>,
             {
-                pub fn recip(self) -> Positive<T> {
-                    <Strict<T> as StrictCarrierOps>::recip(self.0)
-                }
-
-                pub fn try_recip_finite(
-                    self,
-                ) -> Result<Self, ReciprocalOverflow> {
-                    <Strict<T> as StrictCarrierOps>::try_recip_finite(self.0)
+                pub fn from_scalar(x: T) -> Result<Self, InvalidNumber> {
+                    <Strict<T> as StrictCarrierOps>::from_positive_scalar(x)
                         .map($name)
                 }
+
                 /// # Safety
-                /// The caller must ensure that 'self' is a finite positive value.
-                pub unsafe fn recip_finite_unchecked(self) -> Self {
-                    unsafe {
-                        $name(
-                            <Strict<T> as StrictCarrierOps>::recip_finite_unchecked(self.0)
-                        )
-                    }
+                /// The caller must ensure that `x` is positive and finite.
+                pub unsafe fn from_scalar_unchecked(x: T) -> Self {
+                    $name(unsafe {
+                        <Strict<T> as StrictCarrierOps>::from_positive_scalar_unchecked(x)
+                    })
                 }
+
             }
         )*
     };
@@ -163,18 +148,63 @@ macro_rules! newtypes_strict {
 macro_rules! newtypes_non_strict {
     ($($name:ident),* $(,)?) => {
         $(
-            crate::types::float::macros::impl_wrapper_common!($name, NonStrict, NonStrictBounds);
+            crate::types::float::macros::impl_wrapper_common!(
+                $name,
+                NonStrict,
+                NonStrictCarrierOps
+            );
 
             impl<T> $name<T>
             where
                 NonStrict<T>: NonStrictCarrierOps<Scalar = T>,
             {
+                pub fn from_scalar(x: T) -> Result<Self, InvalidNumber> {
+                    <NonStrict<T> as NonStrictCarrierOps>::from_non_negative_scalar(x)
+                        .map($name)
+                }
+
+                /// # Safety
+                /// The caller must ensure that `x` is non-negative and finite.
+                pub unsafe fn from_scalar_unchecked(x: T) -> Self {
+                    $name(unsafe {
+                        <NonStrict<T> as NonStrictCarrierOps>::from_non_negative_scalar_unchecked(x)
+                    })
+                }
+
                 pub fn zero() -> Self {
                     $name(
                         <NonStrict<T> as NonStrictCarrierOps>::zero()
                     )
                 }
             }
+
+            impl<T> std::iter::Sum for $name<T>
+                where
+                    T: FloatScalar,
+                    NonStrict<T>: NonStrictCarrierOps<Scalar = T> + Copy,
+                {
+                    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+                        let total: T = iter.map(|x| x.into_scalar()).sum();
+                        Self(
+                            NonStrict::<T>::from_non_negative_scalar(total)
+                            .expect("sum of non-negative finite floats overflowed"),
+                        )
+                    }
+                }
+
+            impl<'a, T> std::iter::Sum<&'a $name<T>> for $name<T>
+                where
+                    T: FloatScalar,
+                    NonStrict<T>: NonStrictCarrierOps<Scalar = T> + Copy,
+                {
+                    fn sum<I: Iterator<Item = &'a Self>>(iter: I) -> Self {
+                        let total: T = iter.map(|x| x.into_scalar()).sum();
+                        Self(
+                            NonStrict::<T>::from_non_negative_scalar(total)
+                            .expect("sum of non-negative finite floats overflowed"),
+                        )
+                    }
+                }
         )*
     };
 }

@@ -4,12 +4,11 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use crate::{
-    types::float::{
-        NonStrict, NonStrictBounds, NonStrictCarrierOps, Positive, Strict, StrictBounds,
-        StrictCarrierOps, TransparentOver, WrapsCarrierFloat,
+use crate::types::{
+    FloatScalar,
+    float::{
+        InvalidNumber, NonStrict, NonStrictCarrierOps, Strict, StrictCarrierOps, TransparentOver,
     },
-    error::ReciprocalOverflow,
 };
 
 use super::macros::{newtypes_non_strict, newtypes_strict};

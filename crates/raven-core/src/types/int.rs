@@ -75,4 +75,3 @@ impl Div<usize> for TreeIndex {
         TreeIndex(self.0 / rhs)
     }
 }
-
