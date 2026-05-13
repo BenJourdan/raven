@@ -7,7 +7,7 @@ mod scalar;
 pub use quantities::*;
 pub use scalar::{FP_EPSILON32, FP_EPSILON64};
 
-pub(crate) use carrier_ops::{InvalidNumber, NonStrictCarrierOps, StrictCarrierOps};
+pub use carrier_ops::{InvalidNumber, NonStrictCarrierOps, StrictCarrierOps};
 pub(crate) use infra::TransparentOver;
 pub use infra::{reinterpret_slice, reinterpret_vec};
-pub(crate) use scalar::{FloatScalar, NonStrict, Strict};
+pub use scalar::{FloatScalar, NonStrict, Strict};

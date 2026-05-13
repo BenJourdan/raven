@@ -751,10 +751,11 @@ where
 mod tests {
     use super::DynamicClustering;
     use crate::{
-        DynamicClusteringAlg,
+        DynamicClusteringAlg, GraphOracle,
         alg::TreeData,
+        error::DynamicCoresetError,
         error::OracleError,
-        types::{AlgType, NodeDegree, Strict, TreeIndex, Volume},
+        types::{AlgType, NodeDegree, PartitionOutput, PartitionType, Strict, TreeIndex, Volume},
     };
     use priority_queue::PriorityQueue;
     use rustc_hash::{FxHashMap, FxHashSet};
@@ -802,10 +803,37 @@ mod tests {
         });
     }
 
-    fn empty_graph_oracle<'a>(
-        _nodes: &'a [usize],
-    ) -> Result<&'a [&'a [(usize, Strict<f64>)]], OracleError<()>> {
-        Ok(&[])
+    struct EmptyOracle;
+
+    impl EmptyOracle {
+        fn new() -> Self {
+            Self
+        }
+
+        fn empty_rows<'a>(
+            &mut self,
+            nodes: &'a [usize],
+        ) -> Result<Vec<&'a [(usize, Strict<f64>)]>, OracleError<String>> {
+            static EMPTY_NEIGHBOURS: &[(usize, Strict<f64>)] = &[];
+
+            Ok(vec![EMPTY_NEIGHBOURS; nodes.len()])
+        }
+    }
+
+    impl GraphOracle<usize, f64, String> for EmptyOracle {
+        fn graph_neighbourhoods<'a>(
+            &'a mut self,
+            nodes: &'a [usize],
+        ) -> Result<Vec<&'a [(usize, Strict<f64>)]>, OracleError<String>> {
+            self.empty_rows(nodes)
+        }
+
+        fn coreset_neighbourhoods<'a>(
+            &'a mut self,
+            nodes: &'a [usize],
+        ) -> Result<Vec<&'a [(usize, Strict<f64>)]>, OracleError<String>> {
+            self.empty_rows(nodes)
+        }
     }
 
     fn assert_tree_consistent(clustering: &TestClustering) {
@@ -1073,7 +1101,7 @@ mod tests {
     fn apply_node_ops_handles_mixed_delete_insert_modify_batch() {
         let mut clustering = test_clustering();
 
-        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops::<_, ()>(
+        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops(
             &mut clustering,
             &[
                 (1, Some(strict(1.0))),
@@ -1082,12 +1110,11 @@ mod tests {
                 (4, Some(strict(4.0))),
                 (5, Some(strict(5.0))),
             ],
-            &empty_graph_oracle,
         )
         .unwrap();
         assert_tree_consistent(&clustering);
 
-        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops::<_, ()>(
+        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops(
             &mut clustering,
             &[
                 (2, None),
@@ -1096,7 +1123,6 @@ mod tests {
                 (6, Some(strict(6.0))),
                 (7, Some(strict(7.0))),
             ],
-            &empty_graph_oracle,
         )
         .unwrap();
 
@@ -1126,17 +1152,15 @@ mod tests {
     fn apply_node_ops_can_delete_all_nodes() {
         let mut clustering = test_clustering();
 
-        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops::<_, ()>(
+        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops(
             &mut clustering,
             &[(1, Some(strict(1.0))), (2, Some(strict(2.0)))],
-            &empty_graph_oracle,
         )
         .unwrap();
 
-        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops::<_, ()>(
+        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops(
             &mut clustering,
             &[(1, None), (2, None)],
-            &empty_graph_oracle,
         )
         .unwrap();
 
@@ -1144,5 +1168,75 @@ mod tests {
         assert_eq!(clustering.num_leaves(), 0);
         assert!(clustering.node_to_tree_map.is_empty());
         assert!(clustering.tree_data.volume.is_empty());
+    }
+
+    #[test]
+    fn query_empty_tree_returns_no_data_error() {
+        let mut clustering = test_clustering();
+        let mut oracle = EmptyOracle::new();
+
+        let err = <TestClustering as DynamicClusteringAlg<usize, f64>>::query::<_, String>(
+            &mut clustering,
+            PartitionType::All,
+            &mut oracle,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            err.downcast_ref::<DynamicCoresetError>(),
+            Some(DynamicCoresetError::NoData)
+        ));
+    }
+
+    #[test]
+    fn query_runs_after_mixed_node_updates() {
+        let mut clustering = test_clustering();
+        clustering.coreset_size = 3;
+        clustering.sampling_seeds = 2;
+        clustering.cluster_alg = Arc::new(|graph, _| {
+            let n = graph.symbolic().nrows();
+            (vec![0; n], 1)
+        });
+        let mut oracle = EmptyOracle::new();
+
+        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops(
+            &mut clustering,
+            &[
+                (1, Some(strict(1.0))),
+                (2, Some(strict(2.0))),
+                (3, Some(strict(3.0))),
+                (4, Some(strict(4.0))),
+                (5, Some(strict(5.0))),
+                (6, Some(strict(6.0))),
+            ],
+        )
+        .unwrap();
+
+        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops(
+            &mut clustering,
+            &[(2, None), (3, Some(strict(30.0))), (7, Some(strict(7.0)))],
+        )
+        .unwrap();
+
+        let output = <TestClustering as DynamicClusteringAlg<usize, f64>>::query::<_, String>(
+            &mut clustering,
+            PartitionType::All,
+            &mut oracle,
+        )
+        .unwrap();
+
+        match output {
+            PartitionOutput::All(nodes, labels, num_clusters) => {
+                assert_eq!(num_clusters, 1);
+                assert_eq!(nodes.len(), clustering.num_leaves());
+                assert_eq!(labels.len(), nodes.len());
+                assert!(labels.iter().all(|label| *label == 0));
+                assert!(!nodes.contains(&2));
+                assert!(nodes.contains(&7));
+            }
+            PartitionOutput::Subset(_, _) => panic!("expected all-node partition output"),
+        }
+
+        assert_tree_consistent(&clustering);
     }
 }

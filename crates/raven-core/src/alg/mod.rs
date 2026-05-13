@@ -10,7 +10,8 @@ use std::num::NonZeroUsize;
 use anyhow::{Result, anyhow};
 
 use crate::{
-    CoresetNeighbours, DynamicClusteringAlg, GraphBatchNeighbours,
+    DynamicClusteringAlg, GraphOracle,
+    error::DynamicCoresetError,
     types::{
         AlgType, Contribution, FDelta, FloatScalar, HB, HS, NodeDegree, NonStrict,
         NonStrictCarrierOps, PartitionOutput, PartitionType, Strict, StrictCarrierOps, TreeIndex,
@@ -130,14 +131,7 @@ where
     Strict<T>: StrictCarrierOps<Scalar = T> + Copy,
     NonStrict<T>: NonStrictCarrierOps<Scalar = T> + Copy,
 {
-    fn apply_node_ops<G, E>(
-        &mut self,
-        diffs: &[(V, Option<Strict<T>>)],
-        _graph_oracle: &G,
-    ) -> Result<()>
-    where
-        G: GraphBatchNeighbours<V, T, E> + ?Sized,
-    {
+    fn apply_node_ops(&mut self, diffs: &[(V, Option<Strict<T>>)]) -> Result<()> {
         let ops = self.classify_node_ops(diffs)?;
         let mut touched = FxHashSet::default();
 
@@ -153,25 +147,26 @@ where
         Ok(())
     }
 
-    fn query<G, C, E>(
+    fn query<O, E>(
         &mut self,
         partition: PartitionType<V>,
-        graph_oracle: &G,
-        coreset_oracle: &C,
+        oracle: &mut O,
     ) -> Result<PartitionOutput<V>>
     where
-        G: GraphBatchNeighbours<V, T, E> + ?Sized,
-        C: CoresetNeighbours<V, T, E> + ?Sized,
+        O: GraphOracle<V, T, E> + ?Sized,
         E: std::fmt::Display,
     {
+        if self.tree_data.size.is_empty() {
+            return Err(DynamicCoresetError::NoData.into());
+        }
+
         let coreset_size = NonZeroUsize::new(self.coreset_size)
             .ok_or_else(|| anyhow!("coreset_size must be non-zero"))?;
         let sampling_seeds = NonZeroUsize::new(self.sampling_seeds)
             .ok_or_else(|| anyhow!("sampling_seeds must be non-zero"))?;
 
-        let mut coreset =
-            self.extract_coreset(graph_oracle, coreset_oracle, coreset_size, sampling_seeds)?;
-        let coreset_graph = self.build_coreset_graph(&coreset, coreset_oracle)?;
+        let mut coreset = self.extract_coreset(oracle, coreset_size, sampling_seeds)?;
+        let coreset_graph = self.build_coreset_graph(&coreset, oracle)?;
         let (coreset_labels, num_clusters) =
             (self.cluster_alg)(coreset_graph.as_ref(), self.num_clusters);
 
@@ -198,12 +193,12 @@ where
                     .collect::<Vec<_>>();
 
                 let (nodes, labels, _) =
-                    self.rust_label_full_graph(&coreset, num_clusters, graph_oracle, &node_names)?;
+                    self.rust_label_full_graph(&coreset, num_clusters, oracle, &node_names)?;
                 Ok(PartitionOutput::All(nodes, labels, num_clusters))
             }
             PartitionType::Subset(nodes) => {
                 let (_, labels, _) =
-                    self.rust_label_full_graph(&coreset, num_clusters, graph_oracle, nodes)?;
+                    self.rust_label_full_graph(&coreset, num_clusters, oracle, nodes)?;
                 Ok(PartitionOutput::Subset(labels, num_clusters))
             }
         }

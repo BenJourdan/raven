@@ -6,58 +6,37 @@ use types::{PartitionOutput, PartitionType};
 
 use crate::types::Strict;
 
-/// A helper type for the neighbour oracle function.
-/// Given a batch of node identifies, return a slice of
-/// their neighbours and the corresponding edge weights.
-pub trait GraphBatchNeighbours<V, T, E>:
-    for<'a> Fn(&'a [V]) -> Result<&'a [&'a [(V, Strict<T>)]], error::OracleError<E>>
-{
-}
-/// Implement the trait for any function that matches the signature.
-impl<F, V, T, E> GraphBatchNeighbours<V, T, E> for F where
-    F: for<'a> Fn(&'a [V]) -> Result<&'a [&'a [(V, Strict<T>)]], error::OracleError<E>>
-{
-}
+/// Batch neighbourhood oracle used by the dynamic clustering algorithm.
+///
+/// `graph_neighbourhoods` returns complete adjacency rows for graph-wide
+/// lookups. `coreset_neighbourhoods` treats its input batch as the complete
+/// coreset node set for the current query; each returned row must contain only
+/// neighbours that also appear in that same input batch.
+pub trait GraphOracle<V, T, E> {
+    fn graph_neighbourhoods<'a>(
+        &'a mut self,
+        nodes: &'a [V],
+    ) -> Result<Vec<&'a [(V, Strict<T>)]>, error::OracleError<E>>;
 
-// In future, it should be possible to do the above with a trait alias:
-// type GraphBatchNeighbours<V, S, E> = for<'a> Fn(&'a [V]) -> Result<&'a[&'a[(V, S)]], error::OracleError<E>>;
-
-/// A helper type for the coreset neighbour oracle function.
-/// Given a batch of node identifies in the coreset,
-/// return a slice of their neighbours in the coreset
-/// and the corresponding edge weights.
-/// This ignores any edges to nodes outside the coreset.
-pub trait CoresetNeighbours<V, T, E>:
-    for<'a> Fn(&'a [V]) -> Result<&'a [&'a [(V, Strict<T>)]], error::OracleError<E>>
-{
-}
-/// Implement the trait for any function that matches the signature.
-impl<F, V, T, E> CoresetNeighbours<V, T, E> for F where
-    F: for<'a> Fn(&'a [V]) -> Result<&'a [&'a [(V, Strict<T>)]], error::OracleError<E>>
-{
+    fn coreset_neighbourhoods<'a>(
+        &'a mut self,
+        nodes: &'a [V],
+    ) -> Result<Vec<&'a [(V, Strict<T>)]>, error::OracleError<E>>;
 }
 
 /// A trait for dynamic clustering algorithms.
 pub trait DynamicClusteringAlg<V, T> {
     /// Apply a batch of node updates to the data structure.
-    fn apply_node_ops<G, E>(
-        &mut self,
-        diffs: &[(V, Option<Strict<T>>)],
-        graph_oracle: &G,
-    ) -> anyhow::Result<()>
-    where
-        G: GraphBatchNeighbours<V, T, E> + ?Sized; // ?Sized allows for dynamically sized types.
+    fn apply_node_ops(&mut self, diffs: &[(V, Option<Strict<T>>)]) -> anyhow::Result<()>;
 
     /// Query the current clustering with a partition type.
-    fn query<G, C, E>(
+    fn query<O, E>(
         &mut self,
         partition: PartitionType<V>,
-        graph_oracle: &G,
-        coreset_oracle: &C,
+        oracle: &mut O,
     ) -> anyhow::Result<PartitionOutput<V>>
     where
-        G: GraphBatchNeighbours<V, T, E> + ?Sized,
-        C: CoresetNeighbours<V, T, E> + ?Sized,
+        O: GraphOracle<V, T, E> + ?Sized,
         E: std::fmt::Display;
 }
 

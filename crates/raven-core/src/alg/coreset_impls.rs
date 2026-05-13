@@ -8,7 +8,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{DynamicClustering, SamplingInfo};
 use crate::{
-    CoresetNeighbours, GraphBatchNeighbours,
+    GraphOracle,
+    error::DynamicCoresetError,
     types::{
         Contribution, EdgeWeight, FDelta, FloatScalar, HB, HS, NodeDegree, NonStrict,
         NonStrictCarrierOps, Strict, StrictCarrierOps, TreeIndex,
@@ -45,6 +46,65 @@ pub struct Coreset<V, T> {
     pub node_indices: Vec<TreeIndex>,
     pub weights: Vec<Strict<T>>,
     pub coreset_labels: Option<Vec<usize>>,
+}
+
+fn checked_graph_neighbourhoods<'a, V, T, G, E>(
+    oracle: &'a mut G,
+    nodes: &'a [V],
+    context: &str,
+) -> Result<Vec<&'a [(V, Strict<T>)]>>
+where
+    G: GraphOracle<V, T, E> + ?Sized,
+    E: std::fmt::Display,
+{
+    let neighbourhoods = oracle
+        .graph_neighbourhoods(nodes)
+        .map_err(|e| anyhow!("{context}: {e}"))?;
+    if neighbourhoods.len() != nodes.len() {
+        return Err(anyhow!(
+            "{context}: oracle returned {} batches for {} node lookups",
+            neighbourhoods.len(),
+            nodes.len()
+        ));
+    }
+
+    Ok(neighbourhoods)
+}
+
+fn checked_coreset_neighbourhoods<'a, V, T, G, E>(
+    oracle: &'a mut G,
+    nodes: &'a [V],
+    context: &str,
+) -> Result<Vec<&'a [(V, Strict<T>)]>>
+where
+    G: GraphOracle<V, T, E> + ?Sized,
+    E: std::fmt::Display,
+{
+    let neighbourhoods = oracle
+        .coreset_neighbourhoods(nodes)
+        .map_err(|e| anyhow!("{context}: {e}"))?;
+    if neighbourhoods.len() != nodes.len() {
+        return Err(anyhow!(
+            "{context}: oracle returned {} batches for {} node lookups",
+            neighbourhoods.len(),
+            nodes.len()
+        ));
+    }
+
+    Ok(neighbourhoods)
+}
+
+fn checked_single_graph_neighbourhood<'a, V, T, G, E>(
+    oracle: &'a mut G,
+    node_query: &'a [V; 1],
+    context: &str,
+) -> Result<&'a [(V, Strict<T>)]>
+where
+    G: GraphOracle<V, T, E> + ?Sized,
+    E: std::fmt::Display,
+{
+    let neighbourhoods = checked_graph_neighbourhoods(oracle, node_query.as_slice(), context)?;
+    Ok(neighbourhoods[0])
 }
 
 // SamplingInfo impl
@@ -131,49 +191,6 @@ where
     Strict<T>: StrictCarrierOps<Scalar = T> + Copy,
     NonStrict<T>: NonStrictCarrierOps<Scalar = T> + Copy,
 {
-    fn oracle_neighbourhoods<'a, O, E>(
-        oracle: &O,
-        nodes: &'a [V],
-        context: &str,
-    ) -> Result<&'a [&'a [(V, Strict<T>)]]>
-    where
-        O: for<'b> Fn(
-                &'b [V],
-            ) -> std::result::Result<
-                &'b [&'b [(V, Strict<T>)]],
-                crate::error::OracleError<E>,
-            > + ?Sized,
-        E: std::fmt::Display,
-    {
-        let neighbourhoods = oracle(nodes).map_err(|e| anyhow!("{context}: {e}"))?;
-        if neighbourhoods.len() != nodes.len() {
-            return Err(anyhow!(
-                "{context}: oracle returned {} batches for {} node lookups",
-                neighbourhoods.len(),
-                nodes.len()
-            ));
-        }
-
-        Ok(neighbourhoods)
-    }
-
-    fn single_oracle_neighbourhood<'a, O, E>(
-        oracle: &O,
-        node_query: &'a [V; 1],
-        context: &str,
-    ) -> Result<&'a [(V, Strict<T>)]>
-    where
-        O: for<'b> Fn(
-                &'b [V],
-            ) -> std::result::Result<
-                &'b [&'b [(V, Strict<T>)]],
-                crate::error::OracleError<E>,
-            > + ?Sized,
-        E: std::fmt::Display,
-    {
-        Ok(Self::oracle_neighbourhoods(oracle, node_query.as_slice(), context)?[0])
-    }
-
     fn move_seed_membership(
         info: &mut SamplingInfo<V, T>,
         node: V,
@@ -203,16 +220,14 @@ where
         Ok(())
     }
 
-    pub fn extract_coreset<G, C, E>(
+    pub fn extract_coreset<G, E>(
         &mut self,
-        graph_oracle: &G,
-        _coreset_oracle: &C,
+        graph_oracle: &mut G,
         coreset_size: NonZero<usize>,
         sampling_seeds: NonZero<usize>,
     ) -> Result<Coreset<V, T>>
     where
-        G: GraphBatchNeighbours<V, T, E> + ?Sized,
-        C: CoresetNeighbours<V, T, E> + ?Sized,
+        G: GraphOracle<V, T, E> + ?Sized,
         E: std::fmt::Display,
     {
         // basic sanity: can't sample more seeds than leaves or build a coreset smaller than the seed set
@@ -220,7 +235,7 @@ where
             .tree_data
             .size
             .first()
-            .ok_or(anyhow!("tree is empty, no root node"))?;
+            .ok_or(DynamicCoresetError::NoData)?;
         if sampling_seeds.get() < 2 {
             return Err(anyhow!(
                 "Expected at least 2 sampling seeds; got {}",
@@ -343,10 +358,10 @@ where
         &mut self,
         point_added: V,
         info: &mut SamplingInfo<V, T>,
-        graph_oracle: &G,
+        graph_oracle: &mut G,
     ) -> Result<()>
     where
-        G: GraphBatchNeighbours<V, T, E> + ?Sized,
+        G: GraphOracle<V, T, E> + ?Sized,
         E: std::fmt::Display,
     {
         // We implicitly add the point to the init set, update its neighbours,
@@ -388,12 +403,14 @@ where
 
         let point_query = [point_added];
         let neighbours =
-            Self::single_oracle_neighbourhood(graph_oracle, &point_query, "repair point lookup")?;
+            checked_single_graph_neighbourhood(graph_oracle, &point_query, "repair point lookup")?;
 
         let mut filtered_neighbours = Vec::with_capacity(neighbours.len());
 
         for (neighbour, edge_weight) in neighbours.iter() {
-            let neighbour_idx = *self.node_to_tree_map.get(neighbour).unwrap();
+            let neighbour_idx = *self.node_to_tree_map.get(neighbour).ok_or_else(|| {
+                anyhow!("repair point lookup returned a neighbour missing from the tree")
+            })?;
             let neighbour_volume = self.tree_data.volume[neighbour_idx];
 
             let weighted_distance_to_point_added =
@@ -430,7 +447,10 @@ where
                     point_added,
                     neighbour_volume.into_scalar(),
                     &mut old_seeds,
-                    false,
+                    // Nodes can already belong to this seed set. In
+                    // particular, unseen nodes default to x_star, so repairing
+                    // x_star should not try to debit and credit the same seed.
+                    true,
                     "repair neighbour seed move",
                 )?;
             }
@@ -497,7 +517,7 @@ where
             .map(|(s, _)| *s)
             .collect::<Vec<_>>();
         let old_seed_neighbour_batches =
-            Self::oracle_neighbourhoods(graph_oracle, &old_seed_nodes, "old seed lookup")?;
+            checked_graph_neighbourhoods(graph_oracle, &old_seed_nodes, "old seed lookup")?;
 
         for ((s, seed_weight), neighbours) in old_seeds_and_weights
             .into_iter()
@@ -513,7 +533,9 @@ where
                 .iter()
                 .filter(|(neighbour, _)| info.get_seed(*neighbour) == s)
             {
-                let z_idx = *self.node_to_tree_map.get(z).unwrap();
+                let z_idx = *self.node_to_tree_map.get(z).ok_or_else(|| {
+                    anyhow!("old seed lookup returned a neighbour missing from the tree")
+                })?;
                 let deg_z = self.tree_data.volume[z_idx].into_scalar();
                 self.tree_data.h_s[z_idx] =
                     HS::from_scalar(deg_z / seed_weight_scalar).map_err(|e| {
@@ -541,10 +563,10 @@ where
     pub fn build_coreset_graph<C, E>(
         &self,
         coreset: &Coreset<V, T>,
-        coreset_oracle: &C,
+        coreset_oracle: &mut C,
     ) -> Result<SparseRowMat<usize, T>>
     where
-        C: CoresetNeighbours<V, T, E> + ?Sized,
+        C: GraphOracle<V, T, E> + ?Sized,
         E: std::fmt::Display,
     {
         let n = coreset.nodes.len();
@@ -557,7 +579,7 @@ where
             ));
         }
 
-        let coreset_neighbourhoods = Self::oracle_neighbourhoods(
+        let coreset_neighbourhoods = checked_coreset_neighbourhoods(
             coreset_oracle,
             coreset.nodes.as_slice(),
             "coreset graph lookup",
@@ -659,11 +681,11 @@ where
         &self,
         coreset: &Coreset<V, T>,
         num_clusters: usize,
-        graph_oracle: &G,
+        graph_oracle: &mut G,
         nodes: &[V],
     ) -> Result<(Vec<V>, Vec<usize>, Vec<T>)>
     where
-        G: GraphBatchNeighbours<V, T, E> + ?Sized,
+        G: GraphOracle<V, T, E> + ?Sized,
         E: std::fmt::Display,
         V: Send + Sync,
         T: Send + Sync,
@@ -714,7 +736,7 @@ where
         }
 
         let neighbourhoods =
-            Self::oracle_neighbourhoods(graph_oracle, all_nodes.as_slice(), "full graph lookup")?;
+            checked_graph_neighbourhoods(graph_oracle, all_nodes.as_slice(), "full graph lookup")?;
         let adjacency = all_nodes
             .iter()
             .zip(neighbourhoods.iter())

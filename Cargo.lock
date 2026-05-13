@@ -1088,6 +1088,9 @@ dependencies = [
 [[package]]
 name = "raven-adapters"
 version = "0.1.0"
+dependencies = [
+ "raven-core",
+]
 
 [[package]]
 name = "raven-core"
