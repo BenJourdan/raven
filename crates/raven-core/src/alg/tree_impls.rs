@@ -3,10 +3,117 @@ use rustc_hash::FxHashSet;
 use std::{num::NonZero, ops::Range};
 
 use super::DynamicClustering;
-use crate::types::{
-    FDelta, FloatScalar, HB, HS, NodeDegree, NonStrict, NonStrictCarrierOps, Strict,
-    StrictCarrierOps, TreeIndex, Volume,
+use crate::{
+    alg::ResizeQueryInfo,
+    types::{
+        FloatScalar, NodeDegree, NonStrict, NonStrictCarrierOps, Strict, StrictCarrierOps,
+        TreeIndex, Volume,
+    },
 };
+
+/// Shared Zero-Sized helper struct for tree layout calculations.
+/// Will end up being used by both DynamicClustering and trial workspaces.
+pub struct TreeLayout<const ARITY: usize>;
+
+impl<const ARITY: usize> TreeLayout<ARITY> {
+    #[inline(always)]
+    pub fn parent_index(child: TreeIndex) -> Option<TreeIndex> {
+        if child.0 == 0 {
+            None
+        } else {
+            Some((child - TreeIndex(1)) / ARITY)
+        }
+    }
+    #[inline(always)]
+    pub fn child_index(parent: TreeIndex, child: usize) -> TreeIndex {
+        TreeIndex(parent.0 * ARITY + 1 + child)
+    }
+
+    pub fn apply_updates_from_set(
+        total: usize,
+        update_set: &FxHashSet<TreeIndex>,
+        mut update: impl FnMut(TreeIndex),
+    ) {
+        if update_set.is_empty() {
+            return;
+        }
+
+        let mut current = FxHashSet::default();
+        let mut bottom = FxHashSet::default();
+        let n = total as f64;
+        let d = ARITY as f64;
+
+        // For a full d-ary tree:
+        // N = (d^(h+1) - 1)/(d-1) -> h = log_d((d-1)N + 1) - 1
+        // We floor h here; for a complete tree this gives the deepest *full* level,
+        // and the "bottom" level is either h or h+1, but the boundary
+        // (first index of deepest level) is still:
+        //   l_bottom_start = (d^h - 1)/(d-1)
+        let h = (((d - 1.0) * n + 1.0).log(d)).floor() as u32 - 1;
+        let l_bottom_start = (ARITY.pow(h) - 1) / (ARITY - 1);
+
+        for &idx in update_set {
+            if idx.0 >= l_bottom_start {
+                bottom.insert(idx);
+            } else {
+                current.insert(idx);
+            }
+        }
+
+        // process bottom set first, then merge with top set
+        let bottom_parents: FxHashSet<TreeIndex> =
+            bottom.into_iter().filter_map(Self::parent_index).collect();
+        for &parent in &bottom_parents {
+            update(parent);
+        }
+
+        current.extend(bottom_parents);
+
+        // process until current is empty
+        while !current.is_empty() {
+            current = current.into_iter().filter_map(Self::parent_index).collect();
+            for &parent in &current {
+                update(parent);
+            }
+        }
+    }
+
+    pub fn apply_updates_from_single(source: TreeIndex, mut update: impl FnMut(TreeIndex)) {
+        let mut parent = Self::parent_index(source);
+        while let Some(idx) = parent {
+            update(idx);
+            parent = Self::parent_index(idx);
+        }
+    }
+
+    #[inline(always)]
+    pub fn one_step_recompute_with_timestamp<X, F>(
+        parent: TreeIndex,
+        tree: &mut [X],
+        timestamps: &[usize],
+        cur_timestamp: usize,
+        mut fallback: F,
+    ) where
+        X: Copy + std::iter::Sum<X>,
+        F: FnMut(TreeIndex) -> X,
+    {
+        let start = parent.0 * ARITY + 1;
+        if start >= tree.len() {
+            return;
+        }
+        let end = (start + ARITY).min(tree.len());
+
+        tree[parent] = (start..end)
+            .map(|idx| {
+                if timestamps[idx] == cur_timestamp {
+                    tree[idx]
+                } else {
+                    fallback(TreeIndex(idx))
+                }
+            })
+            .sum();
+    }
+}
 
 impl<const ARITY: usize, V, T> DynamicClustering<ARITY, V, T>
 where
@@ -16,15 +123,11 @@ where
     NonStrict<T>: NonStrictCarrierOps<Scalar = T> + Copy,
 {
     pub fn parent_index(&self, child_index: TreeIndex) -> Option<TreeIndex> {
-        if child_index.0 == 0 {
-            None
-        } else {
-            Some((child_index - TreeIndex(1)) / ARITY)
-        }
+        TreeLayout::<ARITY>::parent_index(child_index)
     }
 
     pub fn child_index(&self, parent_index: TreeIndex, child_index: usize) -> TreeIndex {
-        TreeIndex(parent_index.0 * ARITY + 1 + child_index)
+        TreeLayout::<ARITY>::child_index(parent_index, child_index)
     }
 
     pub fn which_child(child_idex: TreeIndex) -> usize {
@@ -159,16 +262,17 @@ where
                     let c_start = self.child_index(p_idx, 0).0;
                     let c_end = (c_start + ARITY).min(total);
 
-                    let size: NonZero<usize> = self.tree_data.size[c_start..c_end]
+                    let size: NonZero<usize> = self.tree_data.persistent.size[c_start..c_end]
                         .iter()
                         .map(|&x| x.get())
                         .sum::<usize>()
                         .try_into()
                         .expect("Size should be nonzero since parent has at least one child");
-                    let volume = sum_non_empty_volumes(&self.tree_data.volume[c_start..c_end]);
+                    let volume =
+                        sum_non_empty_volumes(&self.tree_data.persistent.volume[c_start..c_end]);
 
-                    self.tree_data.size[p] = size;
-                    self.tree_data.volume[p] = volume;
+                    self.tree_data.persistent.size[p] = size;
+                    self.tree_data.persistent.volume[p] = volume;
                 }
 
                 // Now our "bottom" frontier moves up one level
@@ -200,17 +304,18 @@ where
                     let c_start = self.child_index(p_idx, 0).0;
                     let c_end = (c_start + ARITY).min(total);
 
-                    let size: NonZero<usize> = self.tree_data.size[c_start..c_end]
+                    let size: NonZero<usize> = self.tree_data.persistent.size[c_start..c_end]
                         .iter()
                         .map(|&x| x.get())
                         .sum::<usize>()
                         .try_into()
                         .expect("Size should be nonzero since parent has at least one child");
 
-                    let volume = sum_non_empty_volumes(&self.tree_data.volume[c_start..c_end]);
+                    let volume =
+                        sum_non_empty_volumes(&self.tree_data.persistent.volume[c_start..c_end]);
 
-                    self.tree_data.size[0] = size;
-                    self.tree_data.volume[0] = volume;
+                    self.tree_data.persistent.size[0] = size;
+                    self.tree_data.persistent.volume[0] = volume;
                     break;
                 }
 
@@ -222,17 +327,18 @@ where
                     let c_start = self.child_index(p_idx, 0).0;
                     let c_end = (c_start + ARITY).min(total);
 
-                    let size: NonZero<usize> = self.tree_data.size[c_start..c_end]
+                    let size: NonZero<usize> = self.tree_data.persistent.size[c_start..c_end]
                         .iter()
                         .map(|&x| x.get())
                         .sum::<usize>()
                         .try_into()
                         .expect("Size should be nonzero since parent has at least one child");
 
-                    let volume = sum_non_empty_volumes(&self.tree_data.volume[c_start..c_end]);
+                    let volume =
+                        sum_non_empty_volumes(&self.tree_data.persistent.volume[c_start..c_end]);
 
-                    self.tree_data.size[p] = size;
-                    self.tree_data.volume[p] = volume;
+                    self.tree_data.persistent.size[p] = size;
+                    self.tree_data.persistent.volume[p] = volume;
                 }
 
                 // Move top frontier up one level
@@ -246,15 +352,17 @@ where
             let child_start = self.child_index(root_idx, 0).0;
             if child_start < total {
                 let child_end = (child_start + ARITY).min(total);
-                let size: NonZero<usize> = self.tree_data.size[child_start..child_end]
+                let size: NonZero<usize> = self.tree_data.persistent.size[child_start..child_end]
                     .iter()
                     .map(|&x| x.get())
                     .sum::<usize>()
                     .try_into()
                     .expect("Size should be nonzero since parent has at least one child");
-                let volume = sum_non_empty_volumes(&self.tree_data.volume[child_start..child_end]);
-                self.tree_data.size[0] = size;
-                self.tree_data.volume[0] = volume;
+                let volume = sum_non_empty_volumes(
+                    &self.tree_data.persistent.volume[child_start..child_end],
+                );
+                self.tree_data.persistent.size[0] = size;
+                self.tree_data.persistent.volume[0] = volume;
             }
         }
     }
@@ -301,12 +409,17 @@ where
             self.node_to_tree_map.clear();
             self.tree_to_node_map.clear();
             self.degrees.clear();
-            self.tree_data.timestamp.clear();
-            self.tree_data.volume.clear();
-            self.tree_data.size.clear();
-            self.tree_data.f_delta.clear();
-            self.tree_data.h_b.clear();
-            self.tree_data.h_s.clear();
+            self.tree_data.persistent.volume.clear();
+            self.tree_data.persistent.size.clear();
+
+            // Resize query time info if configured to do so during updates.
+            if let ResizeQueryInfo::Updates = self.resize_query_info {
+                self.tree_data
+                    .query_time
+                    .iter_mut()
+                    .for_each(|query_arrs| query_arrs.clear());
+            }
+
             touched.clear();
             return Ok(());
         }
@@ -382,8 +495,8 @@ where
                 .remove(&source)
                 .ok_or_else(|| anyhow!("live tail source was missing from the tree map"))?;
 
-            self.tree_data.volume[dest] = self.tree_data.volume[source];
-            self.tree_data.size[dest] = leaf_size;
+            self.tree_data.persistent.volume[dest] = self.tree_data.persistent.volume[source];
+            self.tree_data.persistent.size[dest] = leaf_size;
 
             self.tree_to_node_map.insert(dest, node);
             self.node_to_tree_map.insert(node, dest);
@@ -418,13 +531,16 @@ where
         {
             touched.insert(dest);
         }
+        self.tree_data.persistent.volume.truncate(new_total);
+        self.tree_data.persistent.size.truncate(new_total);
 
-        self.tree_data.timestamp.truncate(new_total);
-        self.tree_data.volume.truncate(new_total);
-        self.tree_data.size.truncate(new_total);
-        self.tree_data.f_delta.truncate(new_total);
-        self.tree_data.h_b.truncate(new_total);
-        self.tree_data.h_s.truncate(new_total);
+        // Resize query time info if configured to do so during updates.
+        if let ResizeQueryInfo::Updates = self.resize_query_info {
+            self.tree_data
+                .query_time
+                .iter_mut()
+                .for_each(|query_arrs| query_arrs.truncate(new_total));
+        }
 
         if promoted_start < promoted_end {
             self.rebuild_from_leaves(promoted_start, promoted_end);
@@ -481,12 +597,19 @@ where
         let leaf_size = NonZero::new(1).expect("1 is non-zero");
         let volume_filler = Volume::from_scalar(T::ONE).unwrap();
 
-        self.tree_data.timestamp.resize(new_total, 0);
-        self.tree_data.volume.resize(new_total, volume_filler);
-        self.tree_data.size.resize(new_total, leaf_size);
-        self.tree_data.f_delta.resize(new_total, FDelta::zero());
-        self.tree_data.h_b.resize(new_total, HB::zero());
-        self.tree_data.h_s.resize(new_total, HS::zero());
+        self.tree_data
+            .persistent
+            .volume
+            .resize(new_total, volume_filler);
+        self.tree_data.persistent.size.resize(new_total, leaf_size);
+
+        // Resize query time info if configured to do so during updates.
+        if let ResizeQueryInfo::Updates = self.resize_query_info {
+            self.tree_data
+                .query_time
+                .iter_mut()
+                .for_each(|query_arrs| query_arrs.resize(new_total));
+        }
 
         let old_leaf_start = Self::leaf_start_for_leaves(old_leaves);
         let old_leaf_end = old_leaf_start + old_leaves;
@@ -504,6 +627,7 @@ where
             let new_leaf_start = new_internal;
 
             self.tree_data
+                .persistent
                 .volume
                 .copy_within(old_leaf_start..old_leaf_end, new_leaf_start);
 
@@ -519,12 +643,11 @@ where
             let end_new = start_new + added;
             for (i, (node, degree)) in fresh.iter().enumerate() {
                 let idx = TreeIndex(start_new + i);
-                self.tree_data.volume[idx] = Volume::new(*degree);
-                self.tree_data.size[idx] = leaf_size;
-                self.tree_data.timestamp[idx] = 0;
-                self.tree_data.f_delta[idx] = FDelta::zero();
-                self.tree_data.h_b[idx] = HB::zero();
-                self.tree_data.h_s[idx] = HS::zero();
+                self.tree_data.persistent.volume[idx] = Volume::new(*degree);
+                self.tree_data.persistent.size[idx] = leaf_size;
+
+                // don't need to clear query info as timestamps already detect staleness.
+
                 self.tree_to_node_map.insert(idx, *node);
                 self.node_to_tree_map.insert(*node, idx);
                 self.degrees.push(*node, NodeDegree::new(*degree));
@@ -551,6 +674,7 @@ where
             let dest_end = dest_start + promoted;
 
             self.tree_data
+                .persistent
                 .volume
                 .copy_within(src_start..src_end, dest_start);
 
@@ -568,12 +692,9 @@ where
 
             for (i, (node, degree)) in fresh.iter().enumerate() {
                 let idx = TreeIndex(start_new + i);
-                self.tree_data.volume[idx] = Volume::new(*degree);
-                self.tree_data.size[idx] = leaf_size;
-                self.tree_data.timestamp[idx] = 0;
-                self.tree_data.f_delta[idx] = FDelta::zero();
-                self.tree_data.h_b[idx] = HB::zero();
-                self.tree_data.h_s[idx] = HS::zero();
+                self.tree_data.persistent.volume[idx] = Volume::new(*degree);
+                self.tree_data.persistent.size[idx] = leaf_size;
+
                 self.tree_to_node_map.insert(idx, *node);
                 self.node_to_tree_map.insert(*node, idx);
                 self.degrees.push(*node, NodeDegree::new(*degree));
@@ -600,7 +721,7 @@ where
                 .ok_or_else(|| anyhow!("modified node was missing from the tree"))?;
             debug_assert!(Self::is_leaf_index_for_leaves(idx, self.num_leaves()));
 
-            self.tree_data.volume[idx] = Volume::new(*degree);
+            self.tree_data.persistent.volume[idx] = Volume::new(*degree);
             self.degrees.push(*node, NodeDegree::new(*degree));
             touched.insert(idx);
         }
@@ -608,72 +729,21 @@ where
         Ok(())
     }
 
-    pub fn apply_updates_from_set<F: Fn(&mut Self, TreeIndex)>(
+    pub fn apply_updates_from_set<F: FnMut(&mut Self, TreeIndex)>(
         &mut self,
         update_set: &FxHashSet<TreeIndex>,
-        f: F,
+        mut f: F,
     ) {
-        if update_set.is_empty() {
-            return;
-        }
-
-        let mut current = FxHashSet::default();
-        let mut bottom = FxHashSet::default();
-
         let total = self.num_total_nodes();
-        let n = total as f64;
-        let d = ARITY as f64;
-
-        // For a full d-ary tree:
-        // N = (d^(h+1) - 1)/(d-1) -> h = log_d((d-1)N + 1) - 1
-        // We floor h here; for a complete tree this gives the deepest *full* level,
-        // and the "bottom" level is either h or h+1, but the boundary
-        // (first index of deepest level) is still:
-        //   l_bottom_start = (d^h - 1)/(d-1)
-        let h = (((d - 1.0) * n + 1.0).log(d)).floor() as u32 - 1;
-        let l_bottom_start = (ARITY.pow(h) - 1) / (ARITY - 1);
-
-        for &idx in update_set.iter() {
-            if idx.0 >= l_bottom_start {
-                bottom.insert(idx);
-            } else {
-                current.insert(idx);
-            }
-        }
-
-        // process bottom set first, then merge with top set
-        let bottom_parents: FxHashSet<TreeIndex> = bottom
-            .into_iter()
-            .filter_map(|child_idx| self.parent_index(child_idx))
-            .collect();
-        for p_idx in bottom_parents.iter() {
-            f(self, *p_idx);
-        }
-
-        current.extend(bottom_parents.into_iter());
-
-        // process until current is empty
-        while !current.is_empty() {
-            current = current
-                .into_iter()
-                .filter_map(|child_idx| self.parent_index(child_idx))
-                .collect::<FxHashSet<_>>();
-            for p_idx in current.iter() {
-                f(self, *p_idx);
-            }
-        }
+        TreeLayout::<ARITY>::apply_updates_from_set(total, update_set, |idx| f(self, idx));
     }
 
-    pub fn apply_updates_from_single<F: Fn(&mut Self, TreeIndex)>(
+    pub fn apply_updates_from_single<F: FnMut(&mut Self, TreeIndex)>(
         &mut self,
         source: TreeIndex,
-        f: F,
+        mut f: F,
     ) {
-        let mut maybe_parent = self.parent_index(source);
-        while let Some(parent) = maybe_parent {
-            f(self, parent);
-            maybe_parent = self.parent_index(parent);
-        }
+        TreeLayout::<ARITY>::apply_updates_from_single(source, |idx| f(self, idx));
     }
 
     #[inline(always)]
@@ -722,28 +792,18 @@ where
         tree: &mut [X],
         timestamps: &[usize],
         cur_timestamp: usize,
-        mut fallback: F,
+        fallback: F,
     ) where
         X: Copy + std::iter::Sum<X>,
         F: FnMut(TreeIndex) -> X,
     {
-        let start = parent.0 * ARITY + 1;
-        if start >= tree.len() {
-            return;
-        }
-        let end = (start + ARITY).min(tree.len());
-
-        let total = (start..end)
-            .map(|idx| {
-                if timestamps[idx] == cur_timestamp {
-                    tree[idx]
-                } else {
-                    fallback(TreeIndex(idx))
-                }
-            })
-            .sum();
-
-        tree[parent] = total;
+        TreeLayout::<ARITY>::one_step_recompute_with_timestamp(
+            parent,
+            tree,
+            timestamps,
+            cur_timestamp,
+            fallback,
+        );
     }
 }
 
@@ -752,13 +812,14 @@ mod tests {
     use super::DynamicClustering;
     use crate::{
         DynamicClusteringAlg, GraphOracle,
-        alg::TreeData,
         error::DynamicCoresetError,
         error::OracleError,
-        types::{AlgType, NodeDegree, PartitionOutput, PartitionType, Strict, TreeIndex, Volume},
+        types::{
+            AlgType, NodeDegree, PartitionOutput, PartitionType, Strict, TreeIndex, TrialObjective,
+            TrialOutputMode, Volume,
+        },
     };
-    use priority_queue::PriorityQueue;
-    use rustc_hash::{FxHashMap, FxHashSet};
+    use rustc_hash::FxHashSet;
     use std::{num::NonZeroUsize, sync::Arc};
 
     type TestClustering = DynamicClustering<2, usize, f64>;
@@ -774,36 +835,25 @@ mod tests {
     fn test_clustering() -> TestClustering {
         let cluster_alg: AlgType<f64> = Arc::new(|_, _| (Vec::new(), 0));
 
-        DynamicClustering {
-            node_to_tree_map: FxHashMap::default(),
-            tree_to_node_map: FxHashMap::default(),
-            degrees: PriorityQueue::new(),
-            tree_data: TreeData {
-                timestamp: vec![],
-                volume: vec![],
-                size: vec![],
-                f_delta: vec![],
-                h_b: vec![],
-                h_s: vec![],
-            },
-            sigma: strict(1.0),
-            timestamp: 0,
-            coreset_size: 1,
-            sampling_seeds: 1,
-            num_clusters: 1,
-            cluster_alg,
-            prop_name: String::from("w"),
-        }
+        DynamicClustering::new(cluster_alg)
+            .with_sigma(strict(1.0))
+            .with_num_trials(1)
+            .with_coreset_size(1)
+            .with_sampling_seeds(1)
+            .with_num_clusters(1)
+            .with_prop_name("w")
     }
 
     fn apply_size_volume_updates(clustering: &mut TestClustering, touched: &FxHashSet<TreeIndex>) {
         clustering.apply_updates_from_set(touched, |other, idx| {
-            TestClustering::one_step_recompute_size(idx, &mut other.tree_data.size);
-            TestClustering::one_step_recompute_volume(idx, &mut other.tree_data.volume);
+            TestClustering::one_step_recompute_size(idx, &mut other.tree_data.persistent.size);
+            TestClustering::one_step_recompute_volume(idx, &mut other.tree_data.persistent.volume);
         });
     }
 
     struct EmptyOracle;
+
+    pub type EmptyOracleWeightedNodes = [(usize, Strict<f64>)];
 
     impl EmptyOracle {
         fn new() -> Self {
@@ -813,8 +863,8 @@ mod tests {
         fn empty_rows<'a>(
             &mut self,
             nodes: &'a [usize],
-        ) -> Result<Vec<&'a [(usize, Strict<f64>)]>, OracleError<String>> {
-            static EMPTY_NEIGHBOURS: &[(usize, Strict<f64>)] = &[];
+        ) -> Result<Vec<&'a EmptyOracleWeightedNodes>, OracleError<String>> {
+            static EMPTY_NEIGHBOURS: &EmptyOracleWeightedNodes = &[];
 
             Ok(vec![EMPTY_NEIGHBOURS; nodes.len()])
         }
@@ -841,12 +891,15 @@ mod tests {
         let total = TestClustering::total_count_for_leaves(leaves);
         let leaf_range = TestClustering::leaf_range_for_leaves(leaves);
 
-        assert_eq!(clustering.tree_data.timestamp.len(), total);
-        assert_eq!(clustering.tree_data.volume.len(), total);
-        assert_eq!(clustering.tree_data.size.len(), total);
-        assert_eq!(clustering.tree_data.f_delta.len(), total);
-        assert_eq!(clustering.tree_data.h_b.len(), total);
-        assert_eq!(clustering.tree_data.h_s.len(), total);
+        assert_eq!(clustering.tree_data.persistent.volume.len(), total);
+        assert_eq!(clustering.tree_data.persistent.size.len(), total);
+        assert_eq!(clustering.tree_data.query_time.len(), clustering.num_trials);
+        for query_time in &clustering.tree_data.query_time {
+            assert_eq!(query_time.timestamp.len(), total);
+            assert_eq!(query_time.f_delta.len(), total);
+            assert_eq!(query_time.h_b.len(), total);
+            assert_eq!(query_time.h_s.len(), total);
+        }
 
         assert_eq!(clustering.node_to_tree_map.len(), leaves);
         assert_eq!(clustering.tree_to_node_map.len(), leaves);
@@ -867,7 +920,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing degree for node {node}"));
             assert_eq!(
                 degree.into_scalar(),
-                clustering.tree_data.volume[idx].into_scalar()
+                clustering.tree_data.persistent.volume[idx].into_scalar()
             );
         }
 
@@ -881,11 +934,14 @@ mod tests {
 
         let expected_volume = leaf_range
             .clone()
-            .map(|idx| clustering.tree_data.volume[idx].into_scalar())
+            .map(|idx| clustering.tree_data.persistent.volume[idx].into_scalar())
             .sum::<f64>();
-        assert_eq!(clustering.tree_data.size[TreeIndex(0)].get(), leaves);
         assert_eq!(
-            clustering.tree_data.volume[TreeIndex(0)].into_scalar(),
+            clustering.tree_data.persistent.size[TreeIndex(0)].get(),
+            leaves
+        );
+        assert_eq!(
+            clustering.tree_data.persistent.volume[TreeIndex(0)].into_scalar(),
             expected_volume
         );
     }
@@ -936,9 +992,12 @@ mod tests {
             .unwrap();
 
         assert!(touched.is_empty());
-        assert_eq!(clustering.tree_data.volume[TreeIndex(0)], volume(3.0));
         assert_eq!(
-            clustering.tree_data.size[TreeIndex(0)],
+            clustering.tree_data.persistent.volume[TreeIndex(0)],
+            volume(3.0)
+        );
+        assert_eq!(
+            clustering.tree_data.persistent.size[TreeIndex(0)],
             NonZeroUsize::new(2).unwrap()
         );
         assert_eq!(clustering.node_to_tree_map.get(&1), Some(&TreeIndex(1)));
@@ -976,9 +1035,12 @@ mod tests {
         assert_eq!(clustering.node_to_tree_map.get(&1), Some(&TreeIndex(3)));
         assert_eq!(clustering.node_to_tree_map.get(&2), Some(&TreeIndex(2)));
         assert_eq!(clustering.node_to_tree_map.get(&3), Some(&TreeIndex(4)));
-        assert_eq!(clustering.tree_data.volume[TreeIndex(0)], volume(6.0));
         assert_eq!(
-            clustering.tree_data.size[TreeIndex(0)],
+            clustering.tree_data.persistent.volume[TreeIndex(0)],
+            volume(6.0)
+        );
+        assert_eq!(
+            clustering.tree_data.persistent.size[TreeIndex(0)],
             NonZeroUsize::new(3).unwrap()
         );
     }
@@ -1001,15 +1063,18 @@ mod tests {
         clustering.delete_nodes_compact(&[3], &mut touched).unwrap();
         apply_size_volume_updates(&mut clustering, &touched);
 
-        assert_eq!(clustering.tree_data.volume.len(), 3);
+        assert_eq!(clustering.tree_data.persistent.volume.len(), 3);
         assert_eq!(clustering.node_to_tree_map.get(&2), Some(&TreeIndex(1)));
         assert_eq!(clustering.node_to_tree_map.get(&1), Some(&TreeIndex(2)));
         assert!(!clustering.node_to_tree_map.contains_key(&3));
 
         assert_eq!(touched, FxHashSet::from_iter([TreeIndex(2)]));
-        assert_eq!(clustering.tree_data.volume[TreeIndex(0)], volume(3.0));
         assert_eq!(
-            clustering.tree_data.size[TreeIndex(0)],
+            clustering.tree_data.persistent.volume[TreeIndex(0)],
+            volume(3.0)
+        );
+        assert_eq!(
+            clustering.tree_data.persistent.size[TreeIndex(0)],
             NonZeroUsize::new(2).unwrap()
         );
     }
@@ -1029,15 +1094,18 @@ mod tests {
         clustering.delete_nodes_compact(&[1], &mut touched).unwrap();
         apply_size_volume_updates(&mut clustering, &touched);
 
-        assert_eq!(clustering.tree_data.volume.len(), 3);
+        assert_eq!(clustering.tree_data.persistent.volume.len(), 3);
         assert_eq!(clustering.node_to_tree_map.get(&2), Some(&TreeIndex(1)));
         assert_eq!(clustering.node_to_tree_map.get(&3), Some(&TreeIndex(2)));
         assert!(!clustering.node_to_tree_map.contains_key(&1));
 
         assert_eq!(touched, FxHashSet::from_iter([TreeIndex(2)]));
-        assert_eq!(clustering.tree_data.volume[TreeIndex(0)], volume(5.0));
         assert_eq!(
-            clustering.tree_data.size[TreeIndex(0)],
+            clustering.tree_data.persistent.volume[TreeIndex(0)],
+            volume(5.0)
+        );
+        assert_eq!(
+            clustering.tree_data.persistent.size[TreeIndex(0)],
             NonZeroUsize::new(2).unwrap()
         );
     }
@@ -1065,12 +1133,15 @@ mod tests {
             .unwrap();
 
         assert!(touched.is_empty());
-        assert_eq!(clustering.tree_data.volume.len(), 1);
+        assert_eq!(clustering.tree_data.persistent.volume.len(), 1);
         assert_eq!(clustering.node_to_tree_map.get(&5), Some(&TreeIndex(0)));
         assert_eq!(clustering.tree_to_node_map.get(&TreeIndex(0)), Some(&5));
-        assert_eq!(clustering.tree_data.volume[TreeIndex(0)], volume(5.0));
         assert_eq!(
-            clustering.tree_data.size[TreeIndex(0)],
+            clustering.tree_data.persistent.volume[TreeIndex(0)],
+            volume(5.0)
+        );
+        assert_eq!(
+            clustering.tree_data.persistent.size[TreeIndex(0)],
             NonZeroUsize::new(1).unwrap()
         );
     }
@@ -1093,8 +1164,8 @@ mod tests {
         assert!(clustering.node_to_tree_map.is_empty());
         assert!(clustering.tree_to_node_map.is_empty());
         assert!(clustering.degrees.is_empty());
-        assert!(clustering.tree_data.volume.is_empty());
-        assert!(clustering.tree_data.size.is_empty());
+        assert!(clustering.tree_data.persistent.volume.is_empty());
+        assert!(clustering.tree_data.persistent.size.is_empty());
     }
 
     #[test]
@@ -1141,9 +1212,9 @@ mod tests {
             );
         }
 
-        assert_eq!(clustering.tree_data.size[TreeIndex(0)].get(), 5);
+        assert_eq!(clustering.tree_data.persistent.size[TreeIndex(0)].get(), 5);
         assert_eq!(
-            clustering.tree_data.volume[TreeIndex(0)].into_scalar(),
+            clustering.tree_data.persistent.volume[TreeIndex(0)].into_scalar(),
             49.0
         );
     }
@@ -1167,7 +1238,7 @@ mod tests {
         assert_tree_consistent(&clustering);
         assert_eq!(clustering.num_leaves(), 0);
         assert!(clustering.node_to_tree_map.is_empty());
-        assert!(clustering.tree_data.volume.is_empty());
+        assert!(clustering.tree_data.persistent.volume.is_empty());
     }
 
     #[test]
@@ -1178,7 +1249,8 @@ mod tests {
         let err = <TestClustering as DynamicClusteringAlg<usize, f64>>::query::<_, String>(
             &mut clustering,
             PartitionType::All,
-            &mut oracle,
+            TrialOutputMode::AllTrials,
+            &mut [&mut oracle],
         )
         .unwrap_err();
 
@@ -1221,22 +1293,127 @@ mod tests {
         let output = <TestClustering as DynamicClusteringAlg<usize, f64>>::query::<_, String>(
             &mut clustering,
             PartitionType::All,
-            &mut oracle,
+            TrialOutputMode::AllTrials,
+            &mut [&mut oracle],
         )
         .unwrap();
 
         match output {
-            PartitionOutput::All(nodes, labels, num_clusters) => {
-                assert_eq!(num_clusters, 1);
+            PartitionOutput::All(nodes, trial_parts) => {
+                assert_eq!(trial_parts.len(), 1);
+                let trial = &trial_parts[0];
+                assert_eq!(trial.num_clusters, 1);
                 assert_eq!(nodes.len(), clustering.num_leaves());
-                assert_eq!(labels.len(), nodes.len());
-                assert!(labels.iter().all(|label| *label == 0));
+                assert_eq!(trial.labels.len(), nodes.len());
+                assert!(trial.labels.iter().all(|label| *label == 0));
                 assert!(!nodes.contains(&2));
                 assert!(nodes.contains(&7));
             }
-            PartitionOutput::Subset(_, _) => panic!("expected all-node partition output"),
+            PartitionOutput::Subset(_) => panic!("expected all-node partition output"),
         }
 
         assert_tree_consistent(&clustering);
+    }
+
+    #[test]
+    fn query_all_trials_returns_one_partition_per_trial() {
+        let mut clustering = test_clustering()
+            .with_num_trials(2)
+            .with_coreset_size(3)
+            .with_sampling_seeds(2);
+        clustering.cluster_alg = Arc::new(|graph, _| {
+            let n = graph.symbolic().nrows();
+            (vec![0; n], 1)
+        });
+
+        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops(
+            &mut clustering,
+            &[
+                (1, Some(strict(1.0))),
+                (2, Some(strict(2.0))),
+                (3, Some(strict(3.0))),
+                (4, Some(strict(4.0))),
+                (5, Some(strict(5.0))),
+                (6, Some(strict(6.0))),
+            ],
+        )
+        .unwrap();
+
+        let mut oracle_a = EmptyOracle::new();
+        let mut oracle_b = EmptyOracle::new();
+        let output = <TestClustering as DynamicClusteringAlg<usize, f64>>::query::<_, String>(
+            &mut clustering,
+            PartitionType::All,
+            TrialOutputMode::AllTrials,
+            &mut [&mut oracle_a, &mut oracle_b],
+        )
+        .unwrap();
+
+        match output {
+            PartitionOutput::All(nodes, trial_parts) => {
+                assert_eq!(nodes.len(), clustering.num_leaves());
+                assert_eq!(trial_parts.len(), 2);
+                for (expected_idx, trial) in trial_parts.iter().enumerate() {
+                    assert_eq!(trial.trial_index, expected_idx);
+                    assert_eq!(trial.num_clusters, 1);
+                    assert_eq!(trial.labels.len(), nodes.len());
+                    assert!(
+                        trial
+                            .scores
+                            .as_ref()
+                            .is_some_and(|scores| scores.len() == nodes.len())
+                    );
+                }
+            }
+            PartitionOutput::Subset(_) => panic!("expected all-node partition output"),
+        }
+    }
+
+    #[test]
+    fn query_winner_returns_single_partition_with_trial_index() {
+        let mut clustering = test_clustering()
+            .with_num_trials(2)
+            .with_coreset_size(3)
+            .with_sampling_seeds(2);
+        clustering.cluster_alg = Arc::new(|graph, _| {
+            let n = graph.symbolic().nrows();
+            (vec![0; n], 1)
+        });
+
+        <TestClustering as DynamicClusteringAlg<usize, f64>>::apply_node_ops(
+            &mut clustering,
+            &[
+                (1, Some(strict(1.0))),
+                (2, Some(strict(2.0))),
+                (3, Some(strict(3.0))),
+                (4, Some(strict(4.0))),
+                (5, Some(strict(5.0))),
+                (6, Some(strict(6.0))),
+            ],
+        )
+        .unwrap();
+
+        let mut oracle_a = EmptyOracle::new();
+        let mut oracle_b = EmptyOracle::new();
+        let output = <TestClustering as DynamicClusteringAlg<usize, f64>>::query::<_, String>(
+            &mut clustering,
+            PartitionType::All,
+            TrialOutputMode::Winner(TrialObjective::KernelDistance),
+            &mut [&mut oracle_a, &mut oracle_b],
+        )
+        .unwrap();
+
+        match output {
+            PartitionOutput::All(nodes, trial_parts) => {
+                assert_eq!(nodes.len(), clustering.num_leaves());
+                assert_eq!(trial_parts.len(), 1);
+                let trial = &trial_parts[0];
+                assert!(trial.trial_index < 2);
+                assert_eq!(trial.num_clusters, 1);
+                assert_eq!(trial.labels.len(), nodes.len());
+                assert!(trial.scores.is_none());
+            }
+            PartitionOutput::Subset(_) => panic!("expected all-node partition output"),
+        }
     }
 }

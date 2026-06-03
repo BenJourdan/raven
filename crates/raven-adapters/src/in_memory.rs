@@ -274,8 +274,8 @@ mod tests {
     use super::*;
     use raven_core::{
         DynamicClusteringAlg,
-        alg::{DynamicClustering, TreeData},
-        types::{AlgType, PartitionOutput, PartitionType},
+        alg::DynamicClustering,
+        types::{AlgType, PartitionOutput, PartitionType, TrialOutputMode},
     };
     use std::sync::Arc;
 
@@ -291,26 +291,13 @@ mod tests {
             (vec![0; n], 1)
         });
 
-        DynamicClustering {
-            node_to_tree_map: Default::default(),
-            tree_to_node_map: Default::default(),
-            degrees: Default::default(),
-            tree_data: TreeData {
-                timestamp: vec![],
-                volume: vec![],
-                size: vec![],
-                f_delta: vec![],
-                h_b: vec![],
-                h_s: vec![],
-            },
-            sigma: strict(1.0),
-            timestamp: 0,
-            coreset_size: 3,
-            sampling_seeds: 2,
-            num_clusters: 1,
-            cluster_alg,
-            prop_name: String::from("w"),
-        }
+        DynamicClustering::new(cluster_alg)
+            .with_sigma(strict(1.0))
+            .with_num_trials(1)
+            .with_coreset_size(3)
+            .with_sampling_seeds(2)
+            .with_num_clusters(1)
+            .with_prop_name("w")
     }
 
     #[test]
@@ -406,16 +393,23 @@ mod tests {
         let initial_ops = graph.flush_node_ops();
         clustering.apply_node_ops(&initial_ops).unwrap();
 
-        let output = clustering.query(PartitionType::All, &mut graph).unwrap();
+        let output = {
+            let mut oracles = [&mut graph];
+            clustering
+                .query(PartitionType::All, TrialOutputMode::AllTrials, &mut oracles)
+                .unwrap()
+        };
         match output {
-            PartitionOutput::All(nodes, labels, num_clusters) => {
-                assert_eq!(num_clusters, 1);
+            PartitionOutput::All(nodes, trial_parts) => {
+                assert_eq!(trial_parts.len(), 1);
+                let trial = &trial_parts[0];
+                assert_eq!(trial.num_clusters, 1);
                 assert_eq!(nodes.len(), 6);
-                assert_eq!(labels.len(), nodes.len());
+                assert_eq!(trial.labels.len(), nodes.len());
                 assert!(nodes.contains(&1));
                 assert!(nodes.contains(&6));
             }
-            PartitionOutput::Subset(_, _) => panic!("expected all-node query output"),
+            PartitionOutput::Subset(_) => panic!("expected all-node query output"),
         }
 
         graph.update_edge(5, 6, None).unwrap();
@@ -424,16 +418,23 @@ mod tests {
         let update_ops = graph.flush_node_ops();
         clustering.apply_node_ops(&update_ops).unwrap();
 
-        let output = clustering.query(PartitionType::All, &mut graph).unwrap();
+        let output = {
+            let mut oracles = [&mut graph];
+            clustering
+                .query(PartitionType::All, TrialOutputMode::AllTrials, &mut oracles)
+                .unwrap()
+        };
         match output {
-            PartitionOutput::All(nodes, labels, num_clusters) => {
-                assert_eq!(num_clusters, 1);
+            PartitionOutput::All(nodes, trial_parts) => {
+                assert_eq!(trial_parts.len(), 1);
+                let trial = &trial_parts[0];
+                assert_eq!(trial.num_clusters, 1);
                 assert_eq!(nodes.len(), 6);
-                assert_eq!(labels.len(), nodes.len());
+                assert_eq!(trial.labels.len(), nodes.len());
                 assert!(nodes.contains(&7));
                 assert!(!nodes.contains(&6));
             }
-            PartitionOutput::Subset(_, _) => panic!("expected all-node query output"),
+            PartitionOutput::Subset(_) => panic!("expected all-node query output"),
         }
     }
 }

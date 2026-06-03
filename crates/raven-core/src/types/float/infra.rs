@@ -4,6 +4,9 @@ use super::{FloatScalar, NonStrict, Strict};
 ///
 /// This is used by `reinterpret_vec` and `reinterpret_slice` to do zero-copy
 /// casts between wrapper types that share the exact same carrier type.
+/// # Safety
+/// The caller must ensure that the wrapper types have the same size and alignment,
+/// and that the inner carrier types are the same.
 pub unsafe trait TransparentOver {
     type Inner;
 }

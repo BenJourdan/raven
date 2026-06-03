@@ -6,40 +6,15 @@ use rand::RngExt;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{DynamicClustering, SamplingInfo};
+use super::{SamplingInfo, TrialWorkspace, tree_impls::TreeLayout};
 use crate::{
     GraphOracle,
     error::DynamicCoresetError,
     types::{
         Contribution, EdgeWeight, FDelta, FloatScalar, HB, HS, NodeDegree, NonStrict,
-        NonStrictCarrierOps, Strict, StrictCarrierOps, TreeIndex,
+        NonStrictCarrierOps, Strict, StrictCarrierOps, TreeIndex, WeightedNodes,
     },
 };
-
-// use crate::{
-//     alg::TreeData,
-//     diff::{ExtendedEdgeOp, NodeOps},
-//     snapshot_clustering::{GraphLike, PartitionOutput, PartitionType, SnapshotClusteringAlg},
-// };
-// use core::time;
-// use faer::{
-//     sparse::{SparseRowMat, SymbolicSparseRowMat},
-//     traits::num_traits::Inv,
-// };
-// use itertools::{Itertools, multiunzip};
-// use rand::{Rng, SeedableRng, rngs::StdRng};
-// use raphtory::{algorithms::cores, db::graph::node};
-// use rayon::prelude::*;
-// use std::{
-//     collections::{HashMap, HashSet},
-//     fmt::Debug,
-// };
-
-// use anyhow::{Result, anyhow};
-
-// use super::DynamicClustering;
-// use super::common::*;
-// use rayon::prelude::*;
 
 pub struct Coreset<V, T> {
     pub nodes: Vec<V>,
@@ -52,7 +27,7 @@ fn checked_graph_neighbourhoods<'a, V, T, G, E>(
     oracle: &'a mut G,
     nodes: &'a [V],
     context: &str,
-) -> Result<Vec<&'a [(V, Strict<T>)]>>
+) -> Result<Vec<&'a WeightedNodes<V, T>>>
 where
     G: GraphOracle<V, T, E> + ?Sized,
     E: std::fmt::Display,
@@ -75,7 +50,7 @@ fn checked_coreset_neighbourhoods<'a, V, T, G, E>(
     oracle: &'a mut G,
     nodes: &'a [V],
     context: &str,
-) -> Result<Vec<&'a [(V, Strict<T>)]>>
+) -> Result<Vec<&'a WeightedNodes<V, T>>>
 where
     G: GraphOracle<V, T, E> + ?Sized,
     E: std::fmt::Display,
@@ -127,7 +102,7 @@ where
         // because seed sets will always contain at least the seed.
         let mut seed_weight = FxHashMap::<V, Strict<T>>::default();
         // Initially, the only seed is x^*, with seed weight equal to the total weight (volume) of the input
-        seed_weight.insert(x_star.clone(), total_weight);
+        seed_weight.insert(x_star, total_weight);
 
         let mut seed_map = FxHashMap::<V, V>::default();
         // Initially, we just have x^* maps to itself:
@@ -150,7 +125,7 @@ where
 
     pub fn get_seed(&mut self, node: V) -> V {
         // return the seed of a point, defaulting to x_star if not seen before
-        self.seed_map.entry(node).or_insert(self.x_star).clone()
+        *self.seed_map.entry(node).or_insert(self.x_star)
     }
 
     pub fn set_seed(&mut self, node: V, seed: V) {
@@ -184,7 +159,7 @@ where
     }
 }
 
-impl<const ARITY: usize, V, T> DynamicClustering<ARITY, V, T>
+impl<const ARITY: usize, V, T> TrialWorkspace<'_, ARITY, V, T>
 where
     V: std::hash::Hash + Eq + Clone + Copy,
     T: FloatScalar, // T must be a floating point type (either f32 or f64)
@@ -220,19 +195,79 @@ where
         Ok(())
     }
 
-    pub fn extract_coreset<G, E>(
+    fn recompute_f_delta_to_root(&mut self, source: TreeIndex) {
+        let timestamp = self.timestamp;
+        let query_time = &mut *self.query_time;
+        TreeLayout::<ARITY>::apply_updates_from_single(source, |idx| {
+            TreeLayout::<ARITY>::one_step_recompute_with_timestamp(
+                idx,
+                &mut query_time.f_delta,
+                &query_time.timestamp,
+                timestamp,
+                |_i| FDelta::zero(),
+            );
+            query_time.timestamp[idx] = timestamp;
+        });
+    }
+
+    fn recompute_h_to_root(&mut self, source: TreeIndex) {
+        let timestamp = self.timestamp;
+        let persistent = self.persistent;
+        let query_time = &mut *self.query_time;
+        TreeLayout::<ARITY>::apply_updates_from_single(source, |idx| {
+            TreeLayout::<ARITY>::one_step_recompute_with_timestamp(
+                idx,
+                &mut query_time.h_b,
+                &query_time.timestamp,
+                timestamp,
+                |i| {
+                    HB::from_scalar(persistent.volume[i].into_scalar())
+                        .expect("volume must be non-negative")
+                },
+            );
+            TreeLayout::<ARITY>::one_step_recompute_with_timestamp(
+                idx,
+                &mut query_time.h_s,
+                &query_time.timestamp,
+                timestamp,
+                |_i| HS::zero(),
+            );
+            query_time.timestamp[idx] = timestamp;
+        });
+    }
+
+    fn recompute_h_s_from_set(&mut self, update_set: &FxHashSet<TreeIndex>) {
+        let timestamp = self.timestamp;
+        let total = self.persistent.size.len();
+        let query_time = &mut *self.query_time;
+        TreeLayout::<ARITY>::apply_updates_from_set(total, update_set, |idx| {
+            TreeLayout::<ARITY>::one_step_recompute_with_timestamp(
+                idx,
+                &mut query_time.h_s,
+                &query_time.timestamp,
+                timestamp,
+                |_i| HS::zero(),
+            );
+            query_time.timestamp[idx] = timestamp;
+        });
+    }
+
+    pub fn extract_coreset_trial<G, E>(
         &mut self,
         graph_oracle: &mut G,
+        sigma: Strict<T>,
+        x_star: V,
+        x_star_degree: NodeDegree<T>,
         coreset_size: NonZero<usize>,
         sampling_seeds: NonZero<usize>,
     ) -> Result<Coreset<V, T>>
     where
-        G: GraphOracle<V, T, E> + ?Sized,
+        G: GraphOracle<V, T, E> + ?Sized + Send,
         E: std::fmt::Display,
     {
         // basic sanity: can't sample more seeds than leaves or build a coreset smaller than the seed set
         let root_size = self
-            .tree_data
+            .persistent
             .size
             .first()
             .ok_or(DynamicCoresetError::NoData)?;
@@ -252,12 +287,7 @@ where
             ));
         }
 
-        // Increment internal (logical) timestamp:
-        self.timestamp += 1;
         let timestamp = self.timestamp;
-        let sigma = self.sigma;
-
-        let (&x_star, x_star_degree) = self.degrees.peek().ok_or(anyhow!("No nodes in graph"))?;
 
         debug_assert!(
             x_star_degree.into_scalar().is_finite() && x_star_degree.into_scalar() > T::ZERO,
@@ -273,7 +303,7 @@ where
             sigma,
             sigma_over_x_star_deg,
             timestamp,
-            self.tree_data.volume[0].0,
+            self.persistent.volume[0].0,
         );
 
         // sanity: leaves marked deleted should carry zero volume
@@ -285,7 +315,7 @@ where
         let mut rng: rand::rngs::StdRng = rand::make_rng();
 
         // Now we sample a node uniformly:
-        let tree_size = self.tree_data.size.len();
+        let tree_size = self.persistent.size.len();
         let num_leaves = self.node_to_tree_map.len();
 
         let uniform_idx = TreeIndex(rng.random_range(tree_size - num_leaves..tree_size));
@@ -318,7 +348,7 @@ where
             T::from(coreset_size.get()).expect("coreset size should convert to scalar");
         let coreset_iterator = (0..coreset_size.get()).map(|_| {
             let (node, idx, prob) = self.sample_smoothed(&info, &mut rng).unwrap();
-            let node_deg = self.tree_data.volume[idx].into_scalar();
+            let node_deg = self.persistent.volume[idx].into_scalar();
             let weight = node_deg / (prob.into_scalar() * coreset_size_f);
             (node, idx, weight)
         });
@@ -368,7 +398,7 @@ where
         // and seed maps / seed weights.
         let point_added_index = *self.node_to_tree_map.get(&point_added).unwrap();
 
-        let point_added_volume = self.tree_data.volume[point_added_index];
+        let point_added_volume = self.persistent.volume[point_added_index];
         let point_added_degree = NodeDegree::from_scalar(point_added_volume.into_scalar())
             .map_err(|e| anyhow!("point-added volume could not be used as a node degree: {e}"))?;
         let point_added_weight = point_added_volume.into_scalar();
@@ -386,20 +416,10 @@ where
 
         // Zero this point's f contribution by matching f_delta to f_b.
         let f_b = self.f_b(point_added_index, info);
-        self.tree_data.f_delta[point_added_index] = FDelta::from_scalar(f_b.into_scalar())
+        self.query_time.f_delta[point_added_index] = FDelta::from_scalar(f_b.into_scalar())
             .map_err(|e| anyhow!("base contribution could not be stored as f_delta: {e}"))?;
-        self.tree_data.timestamp[point_added_index] = info.timestamp;
-
-        self.apply_updates_from_single(point_added_index, |other, idx| {
-            Self::one_step_recompute_with_timestamp(
-                idx,
-                &mut other.tree_data.f_delta,
-                &other.tree_data.timestamp,
-                info.timestamp,
-                |_i| FDelta::zero(),
-            );
-            other.tree_data.timestamp[idx] = info.timestamp;
-        });
+        self.query_time.timestamp[point_added_index] = info.timestamp;
+        self.recompute_f_delta_to_root(point_added_index);
 
         let point_query = [point_added];
         let neighbours =
@@ -411,7 +431,7 @@ where
             let neighbour_idx = *self.node_to_tree_map.get(neighbour).ok_or_else(|| {
                 anyhow!("repair point lookup returned a neighbour missing from the tree")
             })?;
-            let neighbour_volume = self.tree_data.volume[neighbour_idx];
+            let neighbour_volume = self.persistent.volume[neighbour_idx];
 
             let weighted_distance_to_point_added =
                 Self::weighted_kernel_distance(point_added_degree, EdgeWeight::new(*edge_weight));
@@ -424,22 +444,12 @@ where
                 let new_f_delta_term = (self.f_b(neighbour_idx, info).into_scalar()
                     - weighted_distance_to_point_added.into_scalar())
                 .max(T::ZERO);
-                self.tree_data.f_delta[neighbour_idx] = FDelta::from_scalar(new_f_delta_term)
+                self.query_time.f_delta[neighbour_idx] = FDelta::from_scalar(new_f_delta_term)
                     .map_err(|e| {
                         anyhow!("updated f_delta term was not non-negative finite: {e}")
                     })?;
-                self.tree_data.timestamp[neighbour_idx] = info.timestamp;
-
-                self.apply_updates_from_single(neighbour_idx, |other, idx| {
-                    Self::one_step_recompute_with_timestamp(
-                        idx,
-                        &mut other.tree_data.f_delta,
-                        &other.tree_data.timestamp,
-                        info.timestamp,
-                        |_i| FDelta::zero(),
-                    );
-                    other.tree_data.timestamp[idx] = info.timestamp;
-                });
+                self.query_time.timestamp[neighbour_idx] = info.timestamp;
+                self.recompute_f_delta_to_root(neighbour_idx);
 
                 Self::move_seed_membership(
                     info,
@@ -466,35 +476,15 @@ where
         for z in filtered_neighbours.into_iter().chain([point_added]) {
             let z_idx = *self.node_to_tree_map.get(&z).unwrap();
 
-            self.tree_data.h_b[z_idx] = HB::zero();
-            let deg_z = self.tree_data.volume[z_idx].into_scalar();
-            self.tree_data.h_s[z_idx] =
+            self.query_time.h_b[z_idx] = HB::zero();
+            let deg_z = self.persistent.volume[z_idx].into_scalar();
+            self.query_time.h_s[z_idx] =
                 HS::from_scalar(deg_z / seed_weight_scalar).map_err(|e| {
                     anyhow!("h_s update for new seed set was not non-negative finite: {e}")
                 })?;
 
-            self.tree_data.timestamp[z_idx] = info.timestamp;
-
-            self.apply_updates_from_single(z_idx, |other, idx| {
-                Self::one_step_recompute_with_timestamp(
-                    idx,
-                    &mut other.tree_data.h_b,
-                    &other.tree_data.timestamp,
-                    info.timestamp,
-                    |i| {
-                        HB::from_scalar(other.tree_data.volume[i].into_scalar())
-                            .expect("volume must be non-negative")
-                    },
-                );
-                Self::one_step_recompute_with_timestamp(
-                    idx,
-                    &mut other.tree_data.h_s,
-                    &other.tree_data.timestamp,
-                    info.timestamp,
-                    |_i| HS::zero(),
-                );
-                other.tree_data.timestamp[idx] = info.timestamp;
-            });
+            self.query_time.timestamp[z_idx] = info.timestamp;
+            self.recompute_h_to_root(z_idx);
         }
 
         // Update h_s for nodes in old seed sets whose seed-set weights changed, except x^*.
@@ -536,34 +526,25 @@ where
                 let z_idx = *self.node_to_tree_map.get(z).ok_or_else(|| {
                     anyhow!("old seed lookup returned a neighbour missing from the tree")
                 })?;
-                let deg_z = self.tree_data.volume[z_idx].into_scalar();
-                self.tree_data.h_s[z_idx] =
+                let deg_z = self.persistent.volume[z_idx].into_scalar();
+                self.query_time.h_s[z_idx] =
                     HS::from_scalar(deg_z / seed_weight_scalar).map_err(|e| {
                         anyhow!("h_s rescale for old seed set was not non-negative finite: {e}")
                     })?;
-                self.tree_data.timestamp[z_idx] = timestamp;
+                self.query_time.timestamp[z_idx] = timestamp;
                 h_s_update_set.insert(z_idx);
             }
         }
 
-        self.apply_updates_from_set(&h_s_update_set, |other, idx| {
-            Self::one_step_recompute_with_timestamp(
-                idx,
-                &mut other.tree_data.h_s,
-                &other.tree_data.timestamp,
-                info.timestamp,
-                |_i| HS::zero(),
-            );
-            other.tree_data.timestamp[idx] = info.timestamp;
-        });
+        self.recompute_h_s_from_set(&h_s_update_set);
 
         Ok(())
     }
-
     pub fn build_coreset_graph<C, E>(
         &self,
         coreset: &Coreset<V, T>,
         coreset_oracle: &mut C,
+        sigma: Strict<T>,
     ) -> Result<SparseRowMat<usize, T>>
     where
         C: GraphOracle<V, T, E> + ?Sized,
@@ -598,7 +579,7 @@ where
         let weight_degree_inv = (0..n)
             .map(|idx| {
                 coreset.weights[idx].into_scalar()
-                    / self.tree_data.volume[coreset.node_indices[idx]].into_scalar()
+                    / self.persistent.volume[coreset.node_indices[idx]].into_scalar()
             })
             .collect::<Vec<_>>();
 
@@ -636,7 +617,7 @@ where
                         Some((
                             coreset_j,
                             edge_weight * weight_degree_inv_i * weight_degree_inv_i
-                                + self.sigma.into_scalar()
+                                + sigma.into_scalar()
                                     * coreset.weights[i].into_scalar()
                                     * weight_degree_inv_i,
                         ))
@@ -654,9 +635,7 @@ where
                 // shift term in that case.
                 row_entries.push((
                     i,
-                    self.sigma.into_scalar()
-                        * coreset.weights[i].into_scalar()
-                        * weight_degree_inv_i,
+                    sigma.into_scalar() * coreset.weights[i].into_scalar() * weight_degree_inv_i,
                 ));
             }
 
@@ -676,13 +655,13 @@ where
             data,
         ))
     }
-
     pub fn rust_label_full_graph<G, E>(
         &self,
         coreset: &Coreset<V, T>,
         num_clusters: usize,
         graph_oracle: &mut G,
         nodes: &[V],
+        sigma: Strict<T>,
     ) -> Result<(Vec<V>, Vec<usize>, Vec<T>)>
     where
         G: GraphOracle<V, T, E> + ?Sized,
@@ -703,7 +682,7 @@ where
             ));
         }
 
-        let shift = self.sigma.into_scalar();
+        let shift = sigma.into_scalar();
         let coreset_labels = coreset
             .coreset_labels
             .as_ref()
@@ -732,7 +711,7 @@ where
                 .node_to_tree_map
                 .get(&node)
                 .ok_or_else(|| anyhow!("full graph labelling node was missing from the tree"))?;
-            degree_map.insert(node, self.tree_data.volume[idx].into_scalar());
+            degree_map.insert(node, self.persistent.volume[idx].into_scalar());
         }
 
         let neighbourhoods =

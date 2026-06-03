@@ -2,9 +2,9 @@ pub mod alg;
 pub mod error;
 pub mod types;
 
-use types::{PartitionOutput, PartitionType};
+use types::{PartitionOutput, PartitionType, WeightedNodes};
 
-use crate::types::Strict;
+use crate::types::{Strict, TrialOutputMode};
 
 /// Batch neighbourhood oracle used by the dynamic clustering algorithm.
 ///
@@ -16,12 +16,12 @@ pub trait GraphOracle<V, T, E> {
     fn graph_neighbourhoods<'a>(
         &'a mut self,
         nodes: &'a [V],
-    ) -> Result<Vec<&'a [(V, Strict<T>)]>, error::OracleError<E>>;
+    ) -> Result<Vec<&'a WeightedNodes<V, T>>, error::OracleError<E>>;
 
     fn coreset_neighbourhoods<'a>(
         &'a mut self,
         nodes: &'a [V],
-    ) -> Result<Vec<&'a [(V, Strict<T>)]>, error::OracleError<E>>;
+    ) -> Result<Vec<&'a WeightedNodes<V, T>>, error::OracleError<E>>;
 }
 
 /// A trait for dynamic clustering algorithms.
@@ -33,10 +33,11 @@ pub trait DynamicClusteringAlg<V, T> {
     fn query<O, E>(
         &mut self,
         partition: PartitionType<V>,
-        oracle: &mut O,
-    ) -> anyhow::Result<PartitionOutput<V>>
+        trial_output_mode: TrialOutputMode,
+        oracle: &mut [&mut O],
+    ) -> anyhow::Result<PartitionOutput<V, T>>
     where
-        O: GraphOracle<V, T, E> + ?Sized,
+        O: GraphOracle<V, T, E> + ?Sized + Send,
         E: std::fmt::Display;
 }
 
@@ -47,12 +48,11 @@ mod tests {
     #[test]
     fn imports_work() {
         alg::TreeData::<4, types::Strict<f64>> {
-            timestamp: vec![],
-            volume: vec![],
-            size: vec![],
-            f_delta: vec![],
-            h_b: vec![],
-            h_s: vec![],
+            persistent: alg::Persistent {
+                size: vec![],
+                volume: vec![],
+            },
+            query_time: vec![],
         };
 
         let x = types::Strict::<f64>::new(1.0).unwrap();

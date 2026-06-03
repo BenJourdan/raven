@@ -2,13 +2,13 @@ use anyhow::{Result, anyhow};
 use itertools::izip;
 use rand::RngExt;
 
-use super::{DynamicClustering, SamplingInfo};
+use super::{SamplingInfo, TrialWorkspace, tree_impls::TreeLayout};
 use crate::types::{
     Contribution, EdgeWeight, FDelta, FloatScalar, HB, HS, NodeDegree, NonStrict,
     NonStrictCarrierOps, SmoothedContribution, Strict, StrictCarrierOps, TreeIndex,
 };
 
-impl<const ARITY: usize, V, T> DynamicClustering<ARITY, V, T>
+impl<const ARITY: usize, V, T> TrialWorkspace<'_, ARITY, V, T>
 where
     V: std::hash::Hash + Eq + Clone + Copy,
     T: FloatScalar, // T must be a floating point type (either f32 or f64)
@@ -20,8 +20,8 @@ where
     pub fn f_b(&self, node_idx: TreeIndex, info: &SamplingInfo<V, T>) -> Strict<T> {
         // f_b = sigma* size + (sigma * vol)/deg(x^*)
 
-        let size = (Strict::<T>::from_non_zero_usize(self.tree_data.size[node_idx])).into_scalar();
-        let vol = self.tree_data.volume[node_idx].0.into_scalar();
+        let size = (Strict::<T>::from_non_zero_usize(self.persistent.size[node_idx])).into_scalar();
+        let vol = self.persistent.volume[node_idx].0.into_scalar();
         let sigma = info.sigma.into_scalar();
         let sigma_over_x_star_deg = info.sigma_over_x_star_deg.into_scalar();
 
@@ -34,8 +34,8 @@ where
     #[inline(always)]
     pub fn f_delta_read(&self, node_idx: TreeIndex, info: &SamplingInfo<V, T>) -> FDelta<T> {
         // return saved f_delta if timestamps match, else return 0.
-        if self.tree_data.timestamp[node_idx] == info.timestamp {
-            self.tree_data.f_delta[node_idx]
+        if self.query_time.timestamp[node_idx] == info.timestamp {
+            self.query_time.f_delta[node_idx]
         } else {
             FDelta::zero()
         }
@@ -62,13 +62,13 @@ where
         parent_idx: TreeIndex,
         info: &SamplingInfo<V, T>,
     ) -> usize {
-        let start = self.child_index(parent_idx, 0).0;
-        let end = (start + ARITY).min(self.tree_data.size.len());
+        let start = TreeLayout::<ARITY>::child_index(parent_idx, 0).0;
+        let end = (start + ARITY).min(self.persistent.size.len());
 
-        let sizes = &self.tree_data.size[start..end];
-        let volumes = &self.tree_data.volume[start..end];
-        let saved_f_deltas = &self.tree_data.f_delta[start..end];
-        let saved_timestamps = &self.tree_data.timestamp[start..end];
+        let sizes = &self.persistent.size[start..end];
+        let volumes = &self.persistent.volume[start..end];
+        let saved_f_deltas = &self.query_time.f_delta[start..end];
+        let saved_timestamps = &self.query_time.timestamp[start..end];
 
         let cur_timestamp = info.timestamp;
         let sigma_over_x_star_deg = info.sigma_over_x_star_deg;
@@ -107,10 +107,10 @@ where
 
     #[inline(always)]
     pub fn h_b(&self, node_idx: TreeIndex, info: &SamplingInfo<V, T>) -> HB<T> {
-        let saved_timestamp = self.tree_data.timestamp[node_idx];
+        let saved_timestamp = self.query_time.timestamp[node_idx];
         let cur_timestamp = info.timestamp;
-        let saved_h_b = self.tree_data.h_b[node_idx];
-        let vol = self.tree_data.volume[node_idx].0;
+        let saved_h_b = self.query_time.h_b[node_idx];
+        let vol = self.persistent.volume[node_idx].0;
 
         // If timestamps match, return saved h_b. Else, return vol.
         if saved_timestamp == cur_timestamp {
@@ -122,9 +122,9 @@ where
 
     #[inline(always)]
     pub fn h_s(&self, node_idx: TreeIndex, info: &SamplingInfo<V, T>) -> HS<T> {
-        let saved_timestamp = self.tree_data.timestamp[node_idx];
+        let saved_timestamp = self.query_time.timestamp[node_idx];
         let cur_timestamp = info.timestamp;
-        let saved_h_s = self.tree_data.h_s[node_idx];
+        let saved_h_s = self.query_time.h_s[node_idx];
 
         // If timestamps match, return saved h_s. Else, return 0.
         if saved_timestamp == cur_timestamp {
@@ -162,15 +162,15 @@ where
         parent_idx: TreeIndex,
         info: &SamplingInfo<V, T>,
     ) -> usize {
-        let start = self.child_index(parent_idx, 0).0;
-        let end = (start + ARITY).min(self.tree_data.size.len());
+        let start = TreeLayout::<ARITY>::child_index(parent_idx, 0).0;
+        let end = (start + ARITY).min(self.persistent.size.len());
 
-        let sizes = &self.tree_data.size[start..end];
-        let volumes = &self.tree_data.volume[start..end];
-        let saved_f_deltas = &self.tree_data.f_delta[start..end];
-        let saved_h_bs = &self.tree_data.h_b[start..end];
-        let saved_h_ss = &self.tree_data.h_s[start..end];
-        let saved_timestamps = &self.tree_data.timestamp[start..end];
+        let sizes = &self.persistent.size[start..end];
+        let volumes = &self.persistent.volume[start..end];
+        let saved_f_deltas = &self.query_time.f_delta[start..end];
+        let saved_h_bs = &self.query_time.h_b[start..end];
+        let saved_h_ss = &self.query_time.h_s[start..end];
+        let saved_timestamps = &self.query_time.timestamp[start..end];
 
         let cur_timestamp = info.timestamp;
         let sigma_over_x_star_deg = info.sigma_over_x_star_deg.into_scalar();
@@ -224,7 +224,7 @@ where
         rng: &mut impl rand::Rng,
         fill: impl Fn(&Self, &mut [NonStrict<T>; ARITY], TreeIndex, &SamplingInfo<V, T>) -> usize,
     ) -> Result<(V, TreeIndex, NonStrict<T>)> {
-        if self.tree_data.size.is_empty() {
+        if self.persistent.size.is_empty() {
             return Err(anyhow!("Cannot sample from an empty tree."));
         }
 
@@ -234,7 +234,7 @@ where
         let mut buffer = [NonStrict::zero(); ARITY];
         let mut cdf_buffer = [T::ZERO; ARITY];
 
-        while self.tree_data.size[cur].get() > 1 {
+        while self.persistent.size[cur].get() > 1 {
             // cur corresponds to an internal node
 
             // populate buffer with contributions of children
@@ -270,7 +270,7 @@ where
                 prob.into_scalar() * buffer[child_idx].into_scalar() / child_contribution_sum;
             prob = NonStrict::from_non_negative_scalar(prob_scalar)
                 .expect("sampling probability must be non-negative");
-            cur = self.child_index(cur, child_idx);
+            cur = TreeLayout::<ARITY>::child_index(cur, child_idx);
         }
 
         let node_id = self.tree_to_node_map.get(&cur).unwrap();

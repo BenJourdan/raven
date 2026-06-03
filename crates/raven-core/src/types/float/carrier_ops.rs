@@ -42,7 +42,8 @@ pub trait StrictCarrierOps: Ord + Hash + fmt::Display + Sized {
     type Scalar;
 
     fn from_positive_scalar(x: Self::Scalar) -> Result<Self, InvalidNumber>;
-    /// SAFETY: The caller must ensure that `x` is a valid positive finite number.
+    /// # Safety
+    /// The caller must ensure that `x` is a valid positive finite number.
     unsafe fn from_positive_scalar_unchecked(x: Self::Scalar) -> Self;
     fn into_scalar(self) -> Self::Scalar;
     fn from_non_zero_usize(x: NonZeroUsize) -> Self;
@@ -97,7 +98,8 @@ pub trait NonStrictCarrierOps: Ord + Hash + fmt::Display + Sized {
     type Scalar;
 
     fn from_non_negative_scalar(x: Self::Scalar) -> Result<Self, InvalidNumber>;
-    /// SAFETY: The caller must ensure that `x` is a valid non-negative finite number.
+    /// # Safety
+    /// The caller must ensure that `x` is a valid non-negative finite number.
     unsafe fn from_non_negative_scalar_unchecked(x: Self::Scalar) -> Self;
     fn into_scalar(self) -> Self::Scalar;
     fn zero() -> Self;
