@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use itertools::izip;
 use rand::RngExt;
 
-use super::{SamplingInfo, TrialWorkspace, tree_impls::TreeLayout};
+use super::{SamplingInfo, TreeLayout, TrialWorkspace};
 use crate::types::{
     Contribution, EdgeWeight, FDelta, FloatScalar, HB, HS, NodeDegree, NonStrict,
     NonStrictCarrierOps, SmoothedContribution, Strict, StrictCarrierOps, TreeIndex,

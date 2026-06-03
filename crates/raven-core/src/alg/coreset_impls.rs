@@ -6,7 +6,7 @@ use rand::RngExt;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{SamplingInfo, TrialWorkspace, tree_impls::TreeLayout};
+use super::{SamplingInfo, TreeLayout, TrialWorkspace};
 use crate::{
     GraphOracle,
     error::DynamicCoresetError,
