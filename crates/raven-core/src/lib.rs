@@ -12,7 +12,14 @@ use crate::types::{Strict, TrialOutputMode};
 /// lookups. `coreset_neighbourhoods` treats its input batch as the complete
 /// coreset node set for the current query; each returned row must contain only
 /// neighbours that also appear in that same input batch.
+/// Each Query trial gets its own oracle instance.
+/// All oracles passed to the same query should observe the same
+/// graph snapshot state.
 pub trait GraphOracle<V, T, E> {
+    /// Query the neighbourhoods of a batch of nodes.
+    /// Returned outer vector length must match the input batch size
+    /// and the order must match nodes.
+    /// returned row slices may borrow from self owned data.
     fn graph_neighbourhoods<'a>(
         &'a mut self,
         nodes: &'a [V],
@@ -30,11 +37,13 @@ pub trait DynamicClusteringAlg<V, T> {
     fn apply_node_ops(&mut self, diffs: &[(V, Option<Strict<T>>)]) -> anyhow::Result<()>;
 
     /// Query the current clustering with a partition type.
+    /// oracles length must match the number of trials.
+    /// Trials may run in parallel.
     fn query<O, E>(
         &mut self,
         partition: PartitionType<V>,
         trial_output_mode: TrialOutputMode,
-        oracle: &mut [&mut O],
+        oracles: &mut [&mut O],
     ) -> anyhow::Result<PartitionOutput<V, T>>
     where
         O: GraphOracle<V, T, E> + ?Sized + Send,

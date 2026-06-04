@@ -18,6 +18,10 @@ pub enum PartitionType<'a, V> {
     Subset(&'a [V]),
 }
 
+/// The output of a query trial.
+/// Includes the trial index, the labels,
+/// scores (if used), and the number of clusters.
+/// The ordering of labels and scores respects the input node order.
 #[derive(Debug)]
 pub struct TrialPartition<T> {
     pub trial_index: usize,
@@ -27,7 +31,8 @@ pub struct TrialPartition<T> {
 }
 /// Specify the output format for a partition query.
 /// All: return labels and scores for all nodes, along with the trial partitions.
-/// Subset: return labels and scores only for the specified subset of nodes, along with the trial partitions.
+/// Subset: return labels and scores only for the specified subset of nodes,
+/// along with the trial partitions.
 #[derive(Debug)]
 pub enum PartitionOutput<V, T> {
     All(Vec<V>, Vec<TrialPartition<T>>),
