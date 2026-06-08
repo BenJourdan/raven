@@ -1,4 +1,5 @@
 use priority_queue::PriorityQueue;
+use rand::SeedableRng;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 mod coreset_impls;
@@ -11,7 +12,7 @@ mod workspace;
 #[cfg(test)]
 mod tests;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
 use crate::types::{
     AlgType, Contribution, FloatScalar, NodeDegree, NonStrict, NonStrictCarrierOps, Strict,
@@ -20,6 +21,33 @@ use crate::types::{
 
 pub(crate) use tree_layout::TreeLayout;
 pub use workspace::{Persistent, QueryTime, ResizeQueryInfo, TreeData, TrialWorkspace};
+
+/// Controls how query-trial sampling RNGs are initialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RngMode {
+    /// Seed each trial from fresh system/thread randomness.
+    Random,
+    /// Derive one deterministic RNG seed per trial from the supplied base seed.
+    Seeded(u64),
+}
+
+impl RngMode {
+    pub(crate) fn rng_for_trial(self, trial_index: usize) -> rand::rngs::StdRng {
+        match self {
+            Self::Random => rand::make_rng(),
+            Self::Seeded(seed) => {
+                rand::rngs::StdRng::seed_from_u64(Self::trial_seed(seed, trial_index))
+            }
+        }
+    }
+
+    fn trial_seed(seed: u64, trial_index: usize) -> u64 {
+        let mut z = seed.wrapping_add((trial_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+}
 
 /// ARITY: the maximum number of children per node in the tree
 /// V: the type of the node identifiers
@@ -47,6 +75,7 @@ pub struct DynamicClustering<const ARITY: usize, V, T> {
 
     pub coreset_size: usize,
     pub sampling_seeds: usize,
+    pub rng_mode: RngMode,
 
     pub num_clusters: usize,
     pub cluster_alg: AlgType<T>,
@@ -105,6 +134,7 @@ where
             num_trials,
             coreset_size: 1024,
             sampling_seeds: 20,
+            rng_mode: RngMode::Random,
             num_clusters: 10,
             cluster_alg,
             prop_name: "unknown".to_string(),
@@ -150,6 +180,19 @@ where
     pub fn with_sampling_seeds(mut self, sampling_seeds: usize) -> Self {
         self.sampling_seeds = sampling_seeds;
         self
+    }
+
+    pub fn with_rng_mode(mut self, rng_mode: RngMode) -> Self {
+        self.rng_mode = rng_mode;
+        self
+    }
+
+    pub fn with_rng_seed(self, seed: u64) -> Self {
+        self.with_rng_mode(RngMode::Seeded(seed))
+    }
+
+    pub fn with_random_rng(self) -> Self {
+        self.with_rng_mode(RngMode::Random)
     }
 
     pub fn with_num_clusters(mut self, num_clusters: usize) -> Self {

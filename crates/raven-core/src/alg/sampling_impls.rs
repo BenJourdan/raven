@@ -1,11 +1,11 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use itertools::izip;
 use rand::RngExt;
 
 use super::{SamplingInfo, TreeLayout, TrialWorkspace};
 use crate::types::{
-    Contribution, EdgeWeight, FDelta, FloatScalar, HB, HS, NodeDegree, NonStrict,
-    NonStrictCarrierOps, SmoothedContribution, Strict, StrictCarrierOps, TreeIndex,
+    Contribution, EdgeWeight, FDelta, FloatScalar, NodeDegree, NonStrict, NonStrictCarrierOps,
+    SmoothedContribution, Strict, StrictCarrierOps, TreeIndex, HB, HS,
 };
 
 impl<const ARITY: usize, V, T> TrialWorkspace<'_, ARITY, V, T>
@@ -97,10 +97,8 @@ where
                     .into_scalar()
                     .mul_add(vol_f, -f_delta_f),
             );
-            *o = NonStrict::max(
-                NonStrict::from_non_negative_scalar(total).expect("total must be non-negative"),
-                NonStrict::zero(),
-            );
+            *o = NonStrict::from_non_negative_scalar(total.max(T::zero()))
+                .expect("total must be non-negative after clamping");
         }
         filled
     }
@@ -206,7 +204,9 @@ where
                 T::zero()
             };
 
-            let f_s = sigma.mul_add(size_f, sigma_over_x_star_deg.mul_add(vol_f, -f_delta_f));
+            let f_s = sigma
+                .mul_add(size_f, sigma_over_x_star_deg.mul_add(vol_f, -f_delta_f))
+                .max(T::zero());
 
             let total = f_s.mul_add(
                 total_contribution_inv,
@@ -265,7 +265,7 @@ where
             let child_idx = cdf_buffer[..filled]
                 .iter()
                 .position(|&x| x >= sample)
-                .ok_or(anyhow!("Failed to sample a child node."))?;
+                .ok_or_else(|| anyhow!("Failed to sample a child node."))?;
             let prob_scalar =
                 prob.into_scalar() * buffer[child_idx].into_scalar() / child_contribution_sum;
             prob = NonStrict::from_non_negative_scalar(prob_scalar)

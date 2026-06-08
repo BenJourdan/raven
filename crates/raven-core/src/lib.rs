@@ -1,34 +1,51 @@
 pub mod alg;
+#[cfg(feature = "clustering")]
+pub mod clustering;
 pub mod error;
+pub mod metrics;
 pub mod types;
 
-use types::{PartitionOutput, PartitionType, WeightedNodes};
+use types::{Neighbourhoods, PartitionOutput, PartitionType};
 
 use crate::types::{Strict, TrialOutputMode};
 
 /// Batch neighbourhood oracle used by the dynamic clustering algorithm.
 ///
 /// `graph_neighbourhoods` returns complete adjacency rows for graph-wide
-/// lookups. `coreset_neighbourhoods` treats its input batch as the complete
-/// coreset node set for the current query; each returned row must contain only
-/// neighbours that also appear in that same input batch.
-/// Each Query trial gets its own oracle instance.
+/// lookups. `graph_neighbourhoods_intersecting` returns graph adjacency rows
+/// filtered to a target node set. `coreset_neighbourhoods` treats its input
+/// batch as the complete coreset node set for the current query; each returned
+/// row must contain only neighbours that also appear in that same input batch.
+/// Each query trial gets its own oracle instance.
 /// All oracles passed to the same query should observe the same
 /// graph snapshot state.
 pub trait GraphOracle<V, T, E> {
     /// Query the neighbourhoods of a batch of nodes.
-    /// Returned outer vector length must match the input batch size
-    /// and the order must match nodes.
-    /// returned row slices may borrow from self owned data.
+    ///
+    /// Returned rows must match the input batch length and order. Rows are
+    /// represented as one flat data slice plus offsets, and may borrow from
+    /// oracle-owned scratch storage. Those borrowed rows only need to remain
+    /// valid until the next method call on the same oracle handle.
     fn graph_neighbourhoods<'a>(
         &'a mut self,
-        nodes: &'a [V],
-    ) -> Result<Vec<&'a WeightedNodes<V, T>>, error::OracleError<E>>;
+        nodes: &[V],
+    ) -> Result<Neighbourhoods<'a, V, T>, error::OracleError<E>>;
+
+    /// Query source neighbourhood rows filtered to a target node set.
+    ///
+    /// Returned rows must match the source batch length and order. Targets are
+    /// only used as a filter: missing source nodes should be reported as graph
+    /// errors, but missing target nodes do not need to be validated.
+    fn graph_neighbourhoods_intersecting<'a>(
+        &'a mut self,
+        sources: &[V],
+        targets: &[V],
+    ) -> Result<Neighbourhoods<'a, V, T>, error::OracleError<E>>;
 
     fn coreset_neighbourhoods<'a>(
         &'a mut self,
-        nodes: &'a [V],
-    ) -> Result<Vec<&'a WeightedNodes<V, T>>, error::OracleError<E>>;
+        nodes: &[V],
+    ) -> Result<Neighbourhoods<'a, V, T>, error::OracleError<E>>;
 }
 
 /// A trait for dynamic clustering algorithms.

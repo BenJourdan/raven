@@ -5,10 +5,10 @@ use std::{
 };
 
 use crate::types::{
-    FloatScalar,
     float::{
         InvalidNumber, NonStrict, NonStrictCarrierOps, Strict, StrictCarrierOps, TransparentOver,
     },
+    FloatScalar,
 };
 
 use super::macros::{newtypes_non_strict, newtypes_strict};

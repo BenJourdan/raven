@@ -20,7 +20,11 @@ pub trait FloatScalar: private::Sealed + Sized + num_traits::Float + std::iter::
     const ONE: Self;
 
     fn from_bool(x: bool) -> Self {
-        if x { Self::ONE } else { Self::ZERO }
+        if x {
+            Self::ONE
+        } else {
+            Self::ZERO
+        }
     }
 }
 

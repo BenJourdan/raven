@@ -1,17 +1,17 @@
 use std::num::NonZeroUsize;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use super::{DynamicClustering, ResizeQueryInfo, TrialWorkspace};
 use crate::{
-    DynamicClusteringAlg, GraphOracle,
     error::DynamicCoresetError,
     types::{
         FloatScalar, NonStrict, NonStrictCarrierOps, PartitionOutput, PartitionType, Strict,
         StrictCarrierOps, TrialObjective, TrialOutputMode, TrialPartition,
     },
+    DynamicClusteringAlg, GraphOracle,
 };
 
 impl<const ARITY: usize, V, T> DynamicClusteringAlg<V, T> for DynamicClustering<ARITY, V, T>
@@ -128,6 +128,7 @@ where
         })?;
         let cluster_alg = self.cluster_alg.clone();
         let requested_num_clusters = self.num_clusters;
+        let rng_mode = self.rng_mode;
 
         let node_names = match partition {
             PartitionType::All => {
@@ -151,7 +152,8 @@ where
             .query_time
             .par_iter_mut()
             .zip(oracles.par_iter_mut())
-            .map(|(query_time, oracle)| -> Result<_> {
+            .enumerate()
+            .map(|(trial_index, (query_time, oracle))| -> Result<_> {
                 let mut context = TrialWorkspace::<ARITY, _, _> {
                     timestamp,
                     persistent,
@@ -159,6 +161,7 @@ where
                     node_to_tree_map,
                     tree_to_node_map,
                 };
+                let mut rng = rng_mode.rng_for_trial(trial_index);
                 let mut coreset = context.extract_coreset_trial(
                     &mut **oracle,
                     sigma,
@@ -166,10 +169,12 @@ where
                     x_star_degree,
                     coreset_size,
                     sampling_seeds,
+                    &mut rng,
                 )?;
-                let coreset_graph = context.build_coreset_graph(&coreset, &mut **oracle, sigma)?;
+                let mut coreset_graph =
+                    context.build_coreset_graph(&coreset, &mut **oracle, sigma)?;
                 let (coreset_labels, num_clusters) =
-                    (cluster_alg)(coreset_graph.as_ref(), requested_num_clusters);
+                    (cluster_alg)(&mut coreset_graph, requested_num_clusters);
 
                 if coreset_labels.len() != coreset.nodes.len() {
                     return Err(anyhow!(

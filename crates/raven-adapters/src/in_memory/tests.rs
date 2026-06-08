@@ -7,6 +7,7 @@ use raven_core::{
 };
 
 use super::*;
+use crate::in_memory::workloads::{generate_sbm_commands, prepare_diff_workload_sbm};
 
 type TestClustering = DynamicClustering<2, usize, f64>;
 
@@ -39,9 +40,28 @@ fn graph_oracle_returns_full_adjacency_rows() {
     let rows = oracle.graph_neighbourhoods(&[1, 2]).unwrap();
 
     assert_eq!(rows.len(), 2);
-    assert!(rows[0].contains(&(2, strict(1.5))));
-    assert!(rows[0].contains(&(3, strict(2.5))));
-    assert_eq!(rows[1], &[(1, strict(1.5))]);
+    assert!(rows.row(0).unwrap().contains(&(2, strict(1.5))));
+    assert!(rows.row(0).unwrap().contains(&(3, strict(2.5))));
+    assert_eq!(rows.row(1).unwrap(), &[(1, strict(1.5))]);
+}
+
+#[test]
+fn graph_oracle_returns_intersecting_adjacency_rows() {
+    let mut graph = InMemoryUndirectedGraph::<usize, f64>::new();
+    graph.update_edge(1, 2, Some(strict(1.0))).unwrap();
+    graph.update_edge(1, 3, Some(strict(2.0))).unwrap();
+    graph.update_edge(1, 4, Some(strict(3.0))).unwrap();
+
+    let mut oracle = graph.oracle();
+    let rows = oracle
+        .graph_neighbourhoods_intersecting(&[1, 2], &[3, 4, 99])
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.row(0).unwrap().len(), 2);
+    assert!(rows.row(0).unwrap().contains(&(3, strict(2.0))));
+    assert!(rows.row(0).unwrap().contains(&(4, strict(3.0))));
+    assert!(rows.row(1).unwrap().is_empty());
 }
 
 #[test]
@@ -56,9 +76,9 @@ fn graph_lends_independent_oracle_handles() {
     let left_rows = left[0].graph_neighbourhoods(&[1]).unwrap();
     let right_rows = right[0].graph_neighbourhoods(&[2]).unwrap();
 
-    assert!(left_rows[0].contains(&(2, strict(1.5))));
-    assert!(left_rows[0].contains(&(3, strict(2.5))));
-    assert_eq!(right_rows[0], &[(1, strict(1.5))]);
+    assert!(left_rows.row(0).unwrap().contains(&(2, strict(1.5))));
+    assert!(left_rows.row(0).unwrap().contains(&(3, strict(2.5))));
+    assert_eq!(right_rows.row(0).unwrap(), &[(1, strict(1.5))]);
 }
 
 #[test]
@@ -72,8 +92,8 @@ fn reversed_edge_updates_the_same_undirected_relationship() {
 
     let mut oracle = graph.oracle();
     let rows = oracle.graph_neighbourhoods(&[1, 2]).unwrap();
-    assert_eq!(rows[0], &[(2, strict(2.5))]);
-    assert_eq!(rows[1], &[(1, strict(2.5))]);
+    assert_eq!(rows.row(0).unwrap(), &[(2, strict(2.5))]);
+    assert_eq!(rows.row(1).unwrap(), &[(1, strict(2.5))]);
 }
 
 #[test]
@@ -87,8 +107,8 @@ fn coreset_oracle_filters_to_input_batch() {
     let rows = oracle.coreset_neighbourhoods(&[1, 3]).unwrap();
 
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], &[(3, strict(2.0))]);
-    assert_eq!(rows[1], &[(1, strict(2.0))]);
+    assert_eq!(rows.row(0).unwrap(), &[(3, strict(2.0))]);
+    assert_eq!(rows.row(1).unwrap(), &[(1, strict(2.0))]);
 }
 
 #[test]
@@ -112,8 +132,10 @@ fn flush_node_ops_reports_updated_and_deleted_nodes() {
 
 #[test]
 fn node_ops_buffer_tracks_unique_touched_nodes_until_flush() {
-    let mut graph = InMemoryUndirectedGraph::<usize, f64>::with_node_ops_capacity(
+    let mut graph = InMemoryUndirectedGraph::<usize, f64>::with_capacity(
         NonZeroUsize::new(3).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
     );
 
     graph.update_edge(1, 2, Some(strict(1.0))).unwrap();
@@ -127,6 +149,38 @@ fn node_ops_buffer_tracks_unique_touched_nodes_until_flush() {
     let ops = graph.flush_node_ops();
     assert_eq!(ops.len(), 3);
     assert!(graph.node_ops_buffer_is_empty());
+}
+
+#[test]
+fn cached_degrees_track_replacements_and_deletions() {
+    let mut graph = InMemoryUndirectedGraph::<usize, f64>::with_capacity(
+        NonZeroUsize::new(4).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+    );
+
+    graph.update_edge(1, 2, Some(strict(1.0))).unwrap();
+    graph.update_edge(1, 2, Some(strict(2.5))).unwrap();
+    graph.update_edge(1, 3, Some(strict(1.5))).unwrap();
+
+    assert_eq!(graph.degree(1), Some(strict(4.0)));
+    assert_eq!(graph.degree(2), Some(strict(2.5)));
+    assert_eq!(graph.degree(3), Some(strict(1.5)));
+
+    assert_eq!(
+        graph.flush_node_ops(),
+        vec![
+            (1, Some(strict(4.0))),
+            (2, Some(strict(2.5))),
+            (3, Some(strict(1.5)))
+        ]
+    );
+
+    graph.update_edge(1, 2, None).unwrap();
+    assert_eq!(
+        graph.flush_node_ops(),
+        vec![(1, Some(strict(1.5))), (2, None)]
+    );
 }
 
 #[test]
@@ -219,4 +273,35 @@ fn graph_lends_oracles_to_parallel_core_trials() {
         }
         PartitionOutput::Subset(_) => panic!("expected all-node query output"),
     }
+}
+
+#[test]
+fn sbm_command_generation_is_deterministic() {
+    let first = generate_sbm_commands(42, 8, 3, 0.5, 0.02, 1, 1.0).unwrap();
+    let second = generate_sbm_commands(42, 8, 3, 0.5, 0.02, 1, 1.0).unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(first.nodes.len(), 24);
+    assert_eq!(first.cluster_labels.len(), 24);
+    assert_eq!(first.cluster_labels[0], 0);
+    assert_eq!(first.cluster_labels[8], 1);
+    assert_eq!(first.cluster_labels[16], 2);
+    assert!(!first.operations.is_empty());
+}
+
+#[test]
+fn prepared_sbm_workload_replays_into_in_memory_graph() {
+    let workload = prepare_diff_workload_sbm::<f64>(42, 8, 3, 0.5, 0.02, 1, 1.0, 0.25).unwrap();
+
+    assert_eq!(workload.nodes.len(), 24);
+    assert_eq!(workload.cluster_labels.len(), 24);
+    assert!(!workload.batches.is_empty());
+
+    let mut graph = InMemoryUndirectedGraph::<usize, f64>::new();
+    for batch in &workload.batches {
+        let node_ops = batch.apply_to_graph_and_flush_node_ops(&mut graph).unwrap();
+        assert_eq!(node_ops, batch.node_ops);
+    }
+
+    assert!(workload.nodes.iter().any(|node| graph.contains_node(*node)));
 }

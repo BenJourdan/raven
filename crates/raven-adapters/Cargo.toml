@@ -3,5 +3,20 @@ name = "raven-adapters"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+bench-clustering = ["raven-core/clustering"]
+
 [dependencies]
+indicatif = "0.18.4"
+rand = "0.10.1"
 raven-core.workspace = true
+rustc-hash = "2.1.2"
+tokio = { version = "1.52.3", features = ["rt"] }
+
+[dev-dependencies]
+criterion = "0.7.0"
+
+[[bench]]
+name = "in_memory_query"
+harness = false

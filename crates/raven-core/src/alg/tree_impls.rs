@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use rustc_hash::FxHashSet;
 use std::{num::NonZero, ops::Range};
 
@@ -455,11 +455,10 @@ where
         debug_assert_eq!(self.num_leaves(), new_leaves);
         debug_assert_eq!(self.num_internal_nodes(), new_internal);
         debug_assert!(self.tree_to_node_map.keys().all(|idx| idx.0 < new_total));
-        debug_assert!(
-            self.node_to_tree_map
-                .values()
-                .all(|idx| Self::is_leaf_index_for_leaves(*idx, new_leaves))
-        );
+        debug_assert!(self
+            .node_to_tree_map
+            .values()
+            .all(|idx| Self::is_leaf_index_for_leaves(*idx, new_leaves)));
 
         Ok(())
     }

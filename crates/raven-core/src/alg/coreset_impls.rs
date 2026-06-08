@@ -1,6 +1,6 @@
 use std::num::NonZero;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use faer::sparse::{SparseRowMat, SymbolicSparseRowMat};
 use rand::RngExt;
 use rayon::prelude::*;
@@ -8,12 +8,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{SamplingInfo, TreeLayout, TrialWorkspace};
 use crate::{
-    GraphOracle,
     error::DynamicCoresetError,
     types::{
-        Contribution, EdgeWeight, FDelta, FloatScalar, HB, HS, NodeDegree, NonStrict,
-        NonStrictCarrierOps, Strict, StrictCarrierOps, TreeIndex, WeightedNodes,
+        Contribution, EdgeWeight, FDelta, FloatScalar, Neighbourhoods, NodeDegree, NonStrict,
+        NonStrictCarrierOps, Strict, StrictCarrierOps, TreeIndex, HB, HS,
     },
+    GraphOracle,
 };
 
 pub struct Coreset<V, T> {
@@ -23,53 +23,57 @@ pub struct Coreset<V, T> {
     pub coreset_labels: Option<Vec<usize>>,
 }
 
-fn checked_graph_neighbourhoods<'a, V, T, G, E>(
+#[derive(Debug, Clone, Copy)]
+struct CoresetProjectionInfo<T> {
+    label: usize,
+    weight: T,
+    degree: T,
+}
+
+fn lookup_graph_neighbourhoods<'a, V, T, G, E>(
     oracle: &'a mut G,
-    nodes: &'a [V],
+    nodes: &[V],
     context: &str,
-) -> Result<Vec<&'a WeightedNodes<V, T>>>
+) -> Result<Neighbourhoods<'a, V, T>>
 where
     G: GraphOracle<V, T, E> + ?Sized,
     E: std::fmt::Display,
 {
-    let neighbourhoods = oracle
+    oracle
         .graph_neighbourhoods(nodes)
-        .map_err(|e| anyhow!("{context}: {e}"))?;
-    if neighbourhoods.len() != nodes.len() {
-        return Err(anyhow!(
-            "{context}: oracle returned {} batches for {} node lookups",
-            neighbourhoods.len(),
-            nodes.len()
-        ));
-    }
-
-    Ok(neighbourhoods)
+        .map_err(|e| anyhow!("{context}: {e}"))
 }
 
-fn checked_coreset_neighbourhoods<'a, V, T, G, E>(
+fn lookup_coreset_neighbourhoods<'a, V, T, G, E>(
     oracle: &'a mut G,
-    nodes: &'a [V],
+    nodes: &[V],
     context: &str,
-) -> Result<Vec<&'a WeightedNodes<V, T>>>
+) -> Result<Neighbourhoods<'a, V, T>>
 where
     G: GraphOracle<V, T, E> + ?Sized,
     E: std::fmt::Display,
 {
-    let neighbourhoods = oracle
+    oracle
         .coreset_neighbourhoods(nodes)
-        .map_err(|e| anyhow!("{context}: {e}"))?;
-    if neighbourhoods.len() != nodes.len() {
-        return Err(anyhow!(
-            "{context}: oracle returned {} batches for {} node lookups",
-            neighbourhoods.len(),
-            nodes.len()
-        ));
-    }
-
-    Ok(neighbourhoods)
+        .map_err(|e| anyhow!("{context}: {e}"))
 }
 
-fn checked_single_graph_neighbourhood<'a, V, T, G, E>(
+fn lookup_graph_neighbourhoods_intersecting<'a, V, T, G, E>(
+    oracle: &'a mut G,
+    sources: &[V],
+    targets: &[V],
+    context: &str,
+) -> Result<Neighbourhoods<'a, V, T>>
+where
+    G: GraphOracle<V, T, E> + ?Sized,
+    E: std::fmt::Display,
+{
+    oracle
+        .graph_neighbourhoods_intersecting(sources, targets)
+        .map_err(|e| anyhow!("{context}: {e}"))
+}
+
+fn lookup_single_graph_neighbourhood<'a, V, T, G, E>(
     oracle: &'a mut G,
     node_query: &'a [V; 1],
     context: &str,
@@ -78,8 +82,10 @@ where
     G: GraphOracle<V, T, E> + ?Sized,
     E: std::fmt::Display,
 {
-    let neighbourhoods = checked_graph_neighbourhoods(oracle, node_query.as_slice(), context)?;
-    Ok(neighbourhoods[0])
+    let neighbourhoods = lookup_graph_neighbourhoods(oracle, node_query.as_slice(), context)?;
+    neighbourhoods
+        .row(0)
+        .ok_or_else(|| anyhow!("{context}: oracle returned no row for single-node lookup"))
 }
 
 // SamplingInfo impl
@@ -199,7 +205,7 @@ where
         let timestamp = self.timestamp;
         let query_time = &mut *self.query_time;
         TreeLayout::<ARITY>::apply_updates_from_single(source, |idx| {
-            TreeLayout::<ARITY>::one_step_recompute_with_timestamp(
+            TreeLayout::<ARITY>::one_step_recompute_non_strict_with_timestamp(
                 idx,
                 &mut query_time.f_delta,
                 &query_time.timestamp,
@@ -215,17 +221,18 @@ where
         let persistent = self.persistent;
         let query_time = &mut *self.query_time;
         TreeLayout::<ARITY>::apply_updates_from_single(source, |idx| {
-            TreeLayout::<ARITY>::one_step_recompute_with_timestamp(
+            TreeLayout::<ARITY>::one_step_recompute_non_strict_with_timestamp(
                 idx,
                 &mut query_time.h_b,
                 &query_time.timestamp,
                 timestamp,
                 |i| {
-                    HB::from_scalar(persistent.volume[i].into_scalar())
-                        .expect("volume must be non-negative")
+                    // HB::from_scalar(persistent.volume[i].into_scalar())
+                    //     .expect("volume must be non-negative")
+                    unsafe { HB::from_scalar_unchecked(persistent.volume[i].into_scalar()) }
                 },
             );
-            TreeLayout::<ARITY>::one_step_recompute_with_timestamp(
+            TreeLayout::<ARITY>::one_step_recompute_non_strict_with_timestamp(
                 idx,
                 &mut query_time.h_s,
                 &query_time.timestamp,
@@ -241,7 +248,7 @@ where
         let total = self.persistent.size.len();
         let query_time = &mut *self.query_time;
         TreeLayout::<ARITY>::apply_updates_from_set(total, update_set, |idx| {
-            TreeLayout::<ARITY>::one_step_recompute_with_timestamp(
+            TreeLayout::<ARITY>::one_step_recompute_non_strict_with_timestamp(
                 idx,
                 &mut query_time.h_s,
                 &query_time.timestamp,
@@ -260,6 +267,7 @@ where
         x_star_degree: NodeDegree<T>,
         coreset_size: NonZero<usize>,
         sampling_seeds: NonZero<usize>,
+        rng: &mut impl rand::Rng,
     ) -> Result<Coreset<V, T>>
     where
         G: GraphOracle<V, T, E> + ?Sized + Send,
@@ -312,8 +320,6 @@ where
         // first we add x_star:
         self.repair(x_star, &mut info, graph_oracle)?;
 
-        let mut rng: rand::rngs::StdRng = rand::make_rng();
-
         // Now we sample a node uniformly:
         let tree_size = self.persistent.size.len();
         let num_leaves = self.node_to_tree_map.len();
@@ -325,7 +331,7 @@ where
         let remaining_seeds = sampling_seeds.get().saturating_sub(2);
         for i in 0..remaining_seeds {
             // Sample a point according to f:
-            let (node, _, _) = self.sample(&info, &mut rng).map_err(|e| {
+            let (node, _, _) = self.sample(&info, rng).map_err(|e| {
                 anyhow!("failed sampling seed {} of {}: {e}", i + 1, remaining_seeds)
             })?;
             self.repair(node, &mut info, graph_oracle)?;
@@ -347,7 +353,7 @@ where
         let coreset_size_f =
             T::from(coreset_size.get()).expect("coreset size should convert to scalar");
         let coreset_iterator = (0..coreset_size.get()).map(|_| {
-            let (node, idx, prob) = self.sample_smoothed(&info, &mut rng).unwrap();
+            let (node, idx, prob) = self.sample_smoothed(&info, rng).unwrap();
             let node_deg = self.persistent.volume[idx].into_scalar();
             let weight = node_deg / (prob.into_scalar() * coreset_size_f);
             (node, idx, weight)
@@ -423,7 +429,7 @@ where
 
         let point_query = [point_added];
         let neighbours =
-            checked_single_graph_neighbourhood(graph_oracle, &point_query, "repair point lookup")?;
+            lookup_single_graph_neighbourhood(graph_oracle, &point_query, "repair point lookup")?;
 
         let mut filtered_neighbours = Vec::with_capacity(neighbours.len());
 
@@ -507,11 +513,11 @@ where
             .map(|(s, _)| *s)
             .collect::<Vec<_>>();
         let old_seed_neighbour_batches =
-            checked_graph_neighbourhoods(graph_oracle, &old_seed_nodes, "old seed lookup")?;
+            lookup_graph_neighbourhoods(graph_oracle, &old_seed_nodes, "old seed lookup")?;
 
         for ((s, seed_weight), neighbours) in old_seeds_and_weights
             .into_iter()
-            .zip(old_seed_neighbour_batches.iter().copied())
+            .zip(old_seed_neighbour_batches.iter())
         {
             let seed_weight_scalar = seed_weight.into_scalar();
             debug_assert!(
@@ -560,7 +566,7 @@ where
             ));
         }
 
-        let coreset_neighbourhoods = checked_coreset_neighbourhoods(
+        let coreset_neighbourhoods = lookup_coreset_neighbourhoods(
             coreset_oracle,
             coreset.nodes.as_slice(),
             "coreset graph lookup",
@@ -714,12 +720,71 @@ where
             degree_map.insert(node, self.persistent.volume[idx].into_scalar());
         }
 
-        let neighbourhoods =
-            checked_graph_neighbourhoods(graph_oracle, all_nodes.as_slice(), "full graph lookup")?;
-        let adjacency = all_nodes
+        let (center_norms, center_denoms) = {
+            let coreset_neighbourhoods = lookup_graph_neighbourhoods_intersecting(
+                graph_oracle,
+                coreset.nodes.as_slice(),
+                coreset.nodes.as_slice(),
+                "full graph coreset lookup",
+            )?;
+            let coreset_rows = coreset_neighbourhoods.iter().collect::<Vec<_>>();
+            self.compute_full_graph_center_stats(
+                coreset,
+                num_clusters,
+                coreset_labels,
+                &degree_map,
+                &coreset_rows,
+            )?
+        };
+
+        let labels_and_distances = {
+            let query_neighbourhoods = lookup_graph_neighbourhoods_intersecting(
+                graph_oracle,
+                node_names.as_slice(),
+                coreset.nodes.as_slice(),
+                "full graph query lookup",
+            )?;
+            let query_rows = query_neighbourhoods.iter().collect::<Vec<_>>();
+            self.label_full_graph_nodes_from_centers(
+                node_names.as_slice(),
+                &query_rows,
+                coreset,
+                coreset_labels,
+                &degree_map,
+                &center_norms,
+                &center_denoms,
+                shift,
+            )?
+        };
+
+        Ok((node_names, labels_and_distances.0, labels_and_distances.1))
+    }
+
+    fn compute_full_graph_center_stats(
+        &self,
+        coreset: &Coreset<V, T>,
+        num_clusters: usize,
+        coreset_labels: &[usize],
+        degree_map: &FxHashMap<V, T>,
+        coreset_rows: &[&[(V, Strict<T>)]],
+    ) -> Result<(Vec<T>, Vec<T>)>
+    where
+        V: Send + Sync,
+        T: Send + Sync,
+    {
+        if coreset_rows.len() != coreset.nodes.len() {
+            return Err(anyhow!(
+                "full graph center stat build expected one row per coreset node; got nodes={}, rows={}",
+                coreset.nodes.len(),
+                coreset_rows.len()
+            ));
+        }
+
+        let coreset_adjacency = coreset
+            .nodes
             .iter()
-            .zip(neighbourhoods.iter())
-            .map(|(node, neighbours)| (*node, *neighbours))
+            .copied()
+            .zip(coreset_rows.iter().copied())
             .collect::<FxHashMap<_, _>>();
 
         // Group the coreset nodes/weights by cluster label.
@@ -749,12 +814,15 @@ where
         // Its squared norm is
         //   ||c||^2 = denom^{-2} sum_{i,j in C} w_i w_j k(i,j)
         //
-        // with shifted normalized graph kernel
-        //   k(i,j) = A_ij / (deg(i) deg(j)) + 1[i=j] sigma / deg(i).
+        // with the normalized graph kernel used by dyn-cc's full-graph
+        // projection:
+        //   k(i,j) = A_ij / (deg(i) deg(j)).
         //
-        // We compute the adjacency part from the batched graph oracle and add
-        // the diagonal shift explicitly, so the oracle does not need to emit a
-        // self-loop just for the shift term.
+        // The coreset graph construction applies the sigma diagonal shift before
+        // clustering. During projection, graph oracles must not expose
+        // artificial self-loops, and the diagonal shift is only retained as the
+        // final ||phi(x)||^2 score constant below, where it does not affect the
+        // chosen label.
         let result = coreset_grouped
             .into_par_iter()
             .map(|(indices, weights)| {
@@ -777,19 +845,16 @@ where
                 let mut center_norm_sum = T::ZERO;
 
                 indices.iter().for_each(|i| {
-                    let weight = index_to_weight[i];
                     let vertex_degree =
                         *degree_map.get(i).expect("degree missing for coreset node");
 
-                    center_norm_sum = center_norm_sum + weight * weight * shift / vertex_degree;
-
-                    let neighbours = adjacency.get(i).copied().unwrap_or(&[]);
+                    let neighbours = coreset_adjacency.get(i).copied().unwrap_or(&[]);
                     let adjacency_contrib = neighbours.iter().fold(T::ZERO, |acc, (j, v)| {
                         if indices_set.contains(j) {
                             let neighbour_degree =
                                 *degree_map.get(j).expect("degree missing for neighbour");
                             let value = v.into_scalar() / (vertex_degree * neighbour_degree);
-                            acc + value * weight * index_to_weight[j]
+                            acc + value * index_to_weight[i] * index_to_weight[j]
                         } else {
                             acc
                         }
@@ -802,7 +867,38 @@ where
             })
             .collect::<Vec<(T, T)>>();
 
-        let (center_norms, center_denoms): (Vec<T>, Vec<T>) = result.into_iter().unzip();
+        Ok(result.into_iter().unzip())
+    }
+
+    fn label_full_graph_nodes_from_centers(
+        &self,
+        node_names: &[V],
+        query_rows: &[&[(V, Strict<T>)]],
+        coreset: &Coreset<V, T>,
+        coreset_labels: &[usize],
+        degree_map: &FxHashMap<V, T>,
+        center_norms: &[T],
+        center_denoms: &[T],
+        shift: T,
+    ) -> Result<(Vec<usize>, Vec<T>)>
+    where
+        V: Send + Sync,
+        T: Send + Sync,
+    {
+        if node_names.len() != query_rows.len() {
+            return Err(anyhow!(
+                "full graph labelling expected one row per labelled node; got nodes={}, rows={}",
+                node_names.len(),
+                query_rows.len()
+            ));
+        }
+        if center_norms.len() != center_denoms.len() {
+            return Err(anyhow!(
+                "full graph labelling expected matching center norm/denom lengths; got norms={}, denoms={}",
+                center_norms.len(),
+                center_denoms.len()
+            ));
+        }
 
         // Pick the smallest finite center norm; if none are finite, fall back to cluster 0.
         let mut smallest_center_by_norm = 0usize;
@@ -814,66 +910,61 @@ where
             }
         }
 
-        let coreset_set: FxHashSet<V> = coreset.nodes.iter().copied().collect();
-        let label_map: FxHashMap<V, usize> = coreset
+        let target_info = coreset
             .nodes
             .iter()
             .copied()
             .zip(coreset_labels.iter().copied())
-            .collect();
-        let weight_map: FxHashMap<V, T> = coreset
-            .nodes
-            .iter()
-            .copied()
-            .zip(coreset.weights.iter().map(|weight| weight.into_scalar()))
-            .collect();
+            .zip(coreset.weights.iter())
+            .map(|((node, label), weight)| {
+                let degree = *degree_map
+                    .get(&node)
+                    .expect("degree missing for coreset neighbour");
+                (
+                    node,
+                    CoresetProjectionInfo {
+                        label,
+                        weight: weight.into_scalar(),
+                        degree,
+                    },
+                )
+            })
+            .collect::<FxHashMap<_, _>>();
 
         // For each labelled node x, compute normalized inner products
         //   <phi(x), c_l> = denom_l^{-1} sum_{j in C_l} w_j k(x,j)
         // against each represented center, then choose the center minimizing
         //   ||c_l||^2 - 2 <phi(x), c_l>.
         //
-        // The final distance adds ||phi(x)||^2. This keeps the old implicit
-        // self-adjacency convention for x, plus the same sigma diagonal shift.
+        // The final distance adds ||phi(x)||^2, plus the same sigma diagonal
+        // score constant. The constant is independent of the candidate center,
+        // so it is useful for comparable scores but must not influence label
+        // selection.
         let labels_and_distances: (Vec<usize>, Vec<T>) = node_names
             .par_iter()
+            .zip(query_rows.par_iter())
             .map(|i| {
+                let (i, neighbours) = i;
                 let vertex_degree = *degree_map
                     .get(i)
                     .expect("degree missing for node in labelling pass");
                 let mut x_to_c_is: FxHashMap<usize, T> = FxHashMap::default();
 
-                if let Some(neighbours) = adjacency.get(i).copied() {
-                    neighbours.iter().for_each(|(neighbour, edge_weight)| {
-                        if coreset_set.contains(neighbour) {
-                            let label = label_map[neighbour];
-                            let neighbour_weight = weight_map[neighbour];
-                            let neighbour_degree = *degree_map
-                                .get(neighbour)
-                                .expect("degree missing for neighbour in labelling pass");
+                neighbours.iter().for_each(|(neighbour, edge_weight)| {
+                    let info = target_info
+                        .get(neighbour)
+                        .expect("intersecting oracle returned a non-coreset neighbour");
 
-                            let inner_prod_with_vertex =
-                                edge_weight.into_scalar() / (vertex_degree * neighbour_degree);
+                    let inner_prod_with_vertex =
+                        edge_weight.into_scalar() / (vertex_degree * info.degree);
 
-                            x_to_c_is
-                                .entry(label)
-                                .and_modify(|e| {
-                                    *e = *e + neighbour_weight * inner_prod_with_vertex;
-                                })
-                                .or_insert(neighbour_weight * inner_prod_with_vertex);
-                        }
-                    });
-                }
-
-                if let Some(&label) = label_map.get(i) {
-                    let self_weight = weight_map[i];
                     x_to_c_is
-                        .entry(label)
+                        .entry(info.label)
                         .and_modify(|e| {
-                            *e = *e + self_weight * shift / vertex_degree;
+                            *e = *e + info.weight * inner_prod_with_vertex;
                         })
-                        .or_insert(self_weight * shift / vertex_degree);
-                }
+                        .or_insert(info.weight * inner_prod_with_vertex);
+                });
 
                 x_to_c_is.iter_mut().for_each(|(k, v)| {
                     let denom = center_denoms[*k];
@@ -907,6 +998,6 @@ where
             })
             .unzip();
 
-        Ok((node_names, labels_and_distances.0, labels_and_distances.1))
+        Ok(labels_and_distances)
     }
 }

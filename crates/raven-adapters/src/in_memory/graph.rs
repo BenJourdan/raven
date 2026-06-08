@@ -1,13 +1,9 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    hash::Hash,
-    num::NonZeroUsize,
-};
+use std::{fmt, hash::Hash, num::NonZeroUsize};
 
 use raven_core::types::{FloatScalar, Strict, StrictCarrierOps};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-pub(super) type AdjacencyMap<V, T> = HashMap<V, HashMap<V, Strict<T>>>;
+pub(super) type AdjacencyMap<V, T> = FxHashMap<V, AdjacencyRow<V, T>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InMemoryGraphError {
@@ -37,12 +33,26 @@ impl std::error::Error for InMemoryGraphError {}
 pub struct InMemoryUndirectedGraph<V, T> {
     pub(super) graph: AdjacencyMap<V, T>,
     node_ops: NodeOpsBuffer<V>,
+    adjacency_row_capacity: Option<NonZeroUsize>,
+    degree_rebuild_threshold: Option<NonZeroUsize>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct AdjacencyRow<V, T> {
+    degree: CachedDegree<T>,
+    pub(super) neighbours: FxHashMap<V, Strict<T>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CachedDegree<T> {
+    value: T,
+    dirty_updates: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct NodeOpsBuffer<V> {
     nodes: Vec<V>,
-    seen: HashSet<V>,
+    seen: FxHashSet<V>,
     capacity: Option<NonZeroUsize>,
 }
 
@@ -50,7 +60,7 @@ impl<V> Default for NodeOpsBuffer<V> {
     fn default() -> Self {
         Self {
             nodes: Vec::new(),
-            seen: HashSet::new(),
+            seen: FxHashSet::default(),
             capacity: None,
         }
     }
@@ -62,8 +72,9 @@ where
 {
     pub fn with_capacity(capacity: NonZeroUsize) -> Self {
         Self {
+            nodes: Vec::with_capacity(capacity.get()),
+            seen: FxHashSet::with_capacity_and_hasher(capacity.get(), FxBuildHasher),
             capacity: Some(capacity),
-            ..Self::default()
         }
     }
 
@@ -95,8 +106,10 @@ where
 impl<V, T> Default for InMemoryUndirectedGraph<V, T> {
     fn default() -> Self {
         Self {
-            graph: HashMap::new(),
+            graph: FxHashMap::default(),
             node_ops: NodeOpsBuffer::default(),
+            adjacency_row_capacity: None,
+            degree_rebuild_threshold: None,
         }
     }
 }
@@ -111,10 +124,16 @@ where
         Self::default()
     }
 
-    pub fn with_node_ops_capacity(capacity: NonZeroUsize) -> Self {
+    pub fn with_capacity(
+        capacity: NonZeroUsize,
+        expected_edges_per_node: NonZeroUsize,
+        degree_rebuild_threshold: NonZeroUsize,
+    ) -> Self {
         Self {
+            graph: FxHashMap::with_capacity_and_hasher(capacity.get(), FxBuildHasher),
             node_ops: NodeOpsBuffer::with_capacity(capacity),
-            ..Self::default()
+            adjacency_row_capacity: Some(expected_edges_per_node),
+            degree_rebuild_threshold: Some(degree_rebuild_threshold),
         }
     }
 
@@ -151,22 +170,30 @@ where
 
         match weight {
             Some(weight) => {
-                self.graph.entry(u).or_default().insert(v, weight);
-                self.graph.entry(v).or_default().insert(u, weight);
+                let adjacency_row_capacity = self.adjacency_row_capacity;
+                let cache_enabled = self.degree_rebuild_threshold.is_some();
+
+                self.graph
+                    .entry(u)
+                    .or_insert_with(|| AdjacencyRow::with_capacity(adjacency_row_capacity))
+                    .insert(v, weight, cache_enabled);
+                self.graph
+                    .entry(v)
+                    .or_insert_with(|| AdjacencyRow::with_capacity(adjacency_row_capacity))
+                    .insert(u, weight, cache_enabled);
             }
             None => {
+                let cache_enabled = self.degree_rebuild_threshold.is_some();
                 let removed_uv = self
                     .graph
                     .get_mut(&u)
-                    .and_then(|row| row.remove(&v))
-                    .is_some();
+                    .and_then(|row| row.remove(v, cache_enabled));
                 let removed_vu = self
                     .graph
                     .get_mut(&v)
-                    .and_then(|row| row.remove(&u))
-                    .is_some();
+                    .and_then(|row| row.remove(u, cache_enabled));
 
-                if !removed_uv && !removed_vu {
+                if removed_uv.or(removed_vu).is_none() {
                     return Err(InMemoryGraphError::MissingEdge);
                 }
 
@@ -184,15 +211,17 @@ where
         self.collect_neighbours(node)
     }
 
-    pub fn degree(&self, node: V) -> Option<Strict<T>> {
-        let total = self
-            .graph
-            .get(&node)?
-            .values()
-            .map(|weight| weight.into_scalar())
-            .sum::<T>();
-        Strict::<T>::from_positive_scalar(total).ok()
+    pub fn degree(&mut self, node: V) -> Option<Strict<T>> {
+        let degree = self.degree_scalar(node)?;
+        Strict::<T>::from_positive_scalar(degree)
+            .ok()
+            .or_else(|| self.rebuild_degree(node).and_then(strict_degree))
     }
+
+    pub fn edge_weight(&self, u: V, v: V) -> Option<Strict<T>> {
+        self.graph.get(&u)?.neighbours.get(&v).copied()
+    }
+
     /// Flush buffered node degree diffs for the core algorithm.
     ///
     /// Nodes with no positive degree or no current adjacency row are returned
@@ -206,16 +235,135 @@ where
     }
 
     fn remove_if_isolated(&mut self, node: V) {
-        if self.graph.get(&node).is_some_and(HashMap::is_empty) {
+        if self.graph.get(&node).is_some_and(AdjacencyRow::is_isolated) {
             self.graph.remove(&node);
         }
     }
 
+    fn degree_scalar(&mut self, node: V) -> Option<T> {
+        if self.degree_rebuild_threshold.is_none() {
+            return self.exact_degree_scalar(node);
+        }
+
+        let threshold = self.degree_rebuild_threshold.expect("checked above").get();
+        let row = self.graph.get_mut(&node)?;
+
+        if row.degree.dirty_updates >= threshold {
+            Some(row.rebuild_degree())
+        } else {
+            Some(row.degree.value)
+        }
+    }
+
+    fn exact_degree_scalar(&self, node: V) -> Option<T> {
+        Some(self.graph.get(&node)?.exact_degree())
+    }
+
+    fn rebuild_degree(&mut self, node: V) -> Option<T> {
+        Some(self.graph.get_mut(&node)?.rebuild_degree())
+    }
+
     pub(super) fn collect_neighbours(&self, node: V) -> Option<Vec<(V, Strict<T>)>> {
         self.graph.get(&node).map(|row| {
-            row.iter()
+            row.neighbours
+                .iter()
                 .map(|(&neighbour, &weight)| (neighbour, weight))
                 .collect()
         })
     }
+}
+
+impl<V, T> AdjacencyRow<V, T>
+where
+    V: Eq + Hash + Copy,
+    T: FloatScalar,
+    Strict<T>: StrictCarrierOps<Scalar = T> + Copy,
+{
+    fn with_capacity(capacity: Option<NonZeroUsize>) -> Self {
+        Self {
+            degree: CachedDegree::zero(),
+            neighbours: capacity.map_or_else(FxHashMap::default, |capacity| {
+                FxHashMap::with_capacity_and_hasher(capacity.get(), FxBuildHasher)
+            }),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        neighbour: V,
+        weight: Strict<T>,
+        update_cached_degree: bool,
+    ) -> Option<Strict<T>> {
+        let old_weight = self.neighbours.insert(neighbour, weight);
+
+        if update_cached_degree {
+            let old_weight = old_weight
+                .map(|weight| weight.into_scalar())
+                .unwrap_or(T::ZERO);
+            self.degree.add_delta(weight.into_scalar() - old_weight);
+        }
+
+        old_weight
+    }
+
+    fn remove(&mut self, neighbour: V, update_cached_degree: bool) -> Option<Strict<T>> {
+        let removed_weight = self.neighbours.remove(&neighbour);
+
+        if update_cached_degree {
+            if let Some(weight) = removed_weight {
+                self.degree.add_delta(-weight.into_scalar());
+            }
+        }
+
+        removed_weight
+    }
+
+    fn is_isolated(&self) -> bool {
+        self.neighbours.is_empty()
+    }
+
+    fn exact_degree(&self) -> T {
+        self.neighbours
+            .values()
+            .map(|weight| weight.into_scalar())
+            .sum::<T>()
+    }
+
+    fn rebuild_degree(&mut self) -> T {
+        let value = self.exact_degree();
+        self.degree = CachedDegree {
+            value,
+            dirty_updates: 0,
+        };
+        value
+    }
+}
+
+impl<T> CachedDegree<T>
+where
+    T: FloatScalar,
+{
+    fn zero() -> Self {
+        Self {
+            value: T::ZERO,
+            dirty_updates: 0,
+        }
+    }
+
+    fn add_delta(&mut self, delta: T) {
+        if delta == T::ZERO {
+            return;
+        }
+
+        self.value = self.value + delta;
+        self.dirty_updates = self.dirty_updates.saturating_add(1);
+    }
+}
+
+fn strict_degree<T>(degree: T) -> Option<Strict<T>>
+where
+    T: FloatScalar,
+    Strict<T>: StrictCarrierOps<Scalar = T>,
+{
+    Strict::<T>::from_positive_scalar(degree).ok()
 }

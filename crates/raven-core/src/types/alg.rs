@@ -1,4 +1,4 @@
-use faer::sparse::SparseRowMatRef;
+use faer::sparse::SparseRowMat;
 use std::sync::Arc;
 
 /// Type alias for a clustering algorithm function.
@@ -9,4 +9,4 @@ use std::sync::Arc;
 ///     - a vector of usize cluster assignments for nodes
 ///     - a usize for the actual number of clusters found
 pub type AlgType<T> =
-    Arc<dyn Fn(SparseRowMatRef<usize, T>, usize) -> (Vec<usize>, usize) + Send + Sync + 'static>;
+    Arc<dyn Fn(&mut SparseRowMat<usize, T>, usize) -> (Vec<usize>, usize) + Send + Sync + 'static>;

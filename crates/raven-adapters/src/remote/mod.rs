@@ -4,6 +4,11 @@
 //! client, cache, and oracle concerns so transport/runtime choices can be made
 //! without changing the in-process adapter API.
 
+use std::sync::Arc;
+
+use raven_core::types::{Neighbourhoods, Strict};
+
 pub mod cache;
 pub mod client;
 pub mod oracle;
+

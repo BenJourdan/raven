@@ -3,10 +3,17 @@ name = "raven-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+clustering = [
+  "dep:leiden-rs",
+]
+
 [dependencies]
 anyhow = "1.0.102"
 faer = "0.24.0"
 itertools = "0.14.0"
+leiden-rs = { version = "0.8.1", optional = true, default-features = false }
 num-traits = "0.2.19"
 priority-queue = "2.7.0"
 rand = "0.10.1"

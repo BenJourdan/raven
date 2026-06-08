@@ -2,6 +2,7 @@
 
 mod graph;
 mod oracle;
+pub mod workloads;
 
 pub use graph::{InMemoryGraphError, InMemoryUndirectedGraph, NodeOpsBuffer};
 pub use oracle::InMemoryOracle;

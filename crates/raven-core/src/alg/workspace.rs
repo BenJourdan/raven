@@ -2,7 +2,7 @@ use std::num::NonZeroUsize;
 
 use rustc_hash::FxHashMap;
 
-use crate::types::{FDelta, HB, HS, NonStrict, NonStrictCarrierOps, TreeIndex, Volume};
+use crate::types::{FDelta, NonStrict, NonStrictCarrierOps, TreeIndex, Volume, HB, HS};
 
 /// The tree data backing the dynamic clustering algorithm.
 pub struct TreeData<const ARITY: usize, T> {

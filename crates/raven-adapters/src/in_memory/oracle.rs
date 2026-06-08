@@ -1,30 +1,33 @@
-use std::{collections::HashSet, hash::Hash};
+use std::hash::Hash;
 
 use raven_core::{
     GraphOracle,
     error::OracleError,
-    types::{FloatScalar, Strict, StrictCarrierOps},
+    types::{FloatScalar, Neighbourhoods, Strict, StrictCarrierOps},
 };
+use rustc_hash::FxHashSet;
 
 use super::graph::{AdjacencyMap, InMemoryGraphError, InMemoryUndirectedGraph};
 
 /// Query-only oracle handle borrowed from an [`InMemoryUndirectedGraph`].
 ///
-/// Each handle owns its scratch rows. Multiple handles may therefore be used
+/// Each handle owns its scratch data. Multiple handles may therefore be used
 /// by parallel trials while they all observe the same immutably borrowed graph.
-/// Returned neighbourhood slices borrow this scratch storage and remain valid
+/// Returned neighbourhood rows borrow this scratch storage and remain valid
 /// until the next oracle call on the same handle.
 #[derive(Debug)]
 pub struct InMemoryOracle<'a, V, T> {
     graph: &'a AdjacencyMap<V, T>,
-    scratch_rows: Vec<Vec<(V, Strict<T>)>>,
+    scratch_data: Vec<(V, Strict<T>)>,
+    scratch_offsets: Vec<usize>,
 }
 
 impl<'a, V, T> InMemoryOracle<'a, V, T> {
     fn new(graph: &'a AdjacencyMap<V, T>) -> Self {
         Self {
             graph,
-            scratch_rows: Vec::new(),
+            scratch_data: Vec::new(),
+            scratch_offsets: Vec::new(),
         }
     }
 }
@@ -51,46 +54,101 @@ where
 {
     fn graph_neighbourhoods<'a>(
         &'a mut self,
-        nodes: &'a [V],
-    ) -> Result<Vec<&'a [(V, Strict<T>)]>, OracleError<InMemoryGraphError>> {
-        self.scratch_rows.clear();
-        self.scratch_rows.reserve(nodes.len());
+        nodes: &[V],
+    ) -> Result<Neighbourhoods<'a, V, T>, OracleError<InMemoryGraphError>> {
+        self.scratch_data.clear();
+        self.scratch_offsets.clear();
+        self.scratch_offsets.reserve(nodes.len() + 1);
+        self.scratch_offsets.push(0);
 
         for node in nodes {
             let row = self
                 .graph
                 .get(node)
-                .ok_or(OracleError::GraphError(InMemoryGraphError::MissingNode))?
-                .iter()
-                .map(|(&neighbour, &weight)| (neighbour, weight))
-                .collect();
-            self.scratch_rows.push(row);
+                .ok_or(OracleError::GraphError(InMemoryGraphError::MissingNode))?;
+            self.scratch_data.extend(
+                row.neighbours
+                    .iter()
+                    .map(|(&neighbour, &weight)| (neighbour, weight)),
+            );
+            self.scratch_offsets.push(self.scratch_data.len());
         }
 
-        Ok(self.scratch_rows.iter().map(Vec::as_slice).collect())
+        Ok(Neighbourhoods::new(
+            &self.scratch_data,
+            &self.scratch_offsets,
+        ))
+    }
+
+    fn graph_neighbourhoods_intersecting<'a>(
+        &'a mut self,
+        sources: &[V],
+        targets: &[V],
+    ) -> Result<Neighbourhoods<'a, V, T>, OracleError<InMemoryGraphError>> {
+        let target_set = targets.iter().copied().collect::<FxHashSet<_>>();
+
+        self.scratch_data.clear();
+        self.scratch_offsets.clear();
+        self.scratch_offsets.reserve(sources.len() + 1);
+        self.scratch_offsets.push(0);
+
+        for source in sources {
+            let row = self
+                .graph
+                .get(source)
+                .ok_or(OracleError::GraphError(InMemoryGraphError::MissingNode))?;
+
+            if target_set.len() < row.neighbours.len() {
+                self.scratch_data
+                    .extend(target_set.iter().filter_map(|&target| {
+                        row.neighbours.get(&target).map(|&weight| (target, weight))
+                    }));
+            } else {
+                self.scratch_data.extend(
+                    row.neighbours
+                        .iter()
+                        .filter(|(neighbour, _)| target_set.contains(neighbour))
+                        .map(|(&neighbour, &weight)| (neighbour, weight)),
+                );
+            }
+
+            self.scratch_offsets.push(self.scratch_data.len());
+        }
+
+        Ok(Neighbourhoods::new(
+            &self.scratch_data,
+            &self.scratch_offsets,
+        ))
     }
 
     fn coreset_neighbourhoods<'a>(
         &'a mut self,
-        nodes: &'a [V],
-    ) -> Result<Vec<&'a [(V, Strict<T>)]>, OracleError<InMemoryGraphError>> {
-        let coreset_members = nodes.iter().copied().collect::<HashSet<_>>();
+        nodes: &[V],
+    ) -> Result<Neighbourhoods<'a, V, T>, OracleError<InMemoryGraphError>> {
+        let coreset_members = nodes.iter().copied().collect::<FxHashSet<_>>();
 
-        self.scratch_rows.clear();
-        self.scratch_rows.reserve(nodes.len());
+        self.scratch_data.clear();
+        self.scratch_offsets.clear();
+        self.scratch_offsets.reserve(nodes.len() + 1);
+        self.scratch_offsets.push(0);
 
         for node in nodes {
             let row = self
                 .graph
                 .get(node)
-                .ok_or(OracleError::CoresetError(InMemoryGraphError::MissingNode))?
-                .iter()
-                .filter(|(neighbour, _)| coreset_members.contains(neighbour))
-                .map(|(&neighbour, &weight)| (neighbour, weight))
-                .collect();
-            self.scratch_rows.push(row);
+                .ok_or(OracleError::CoresetError(InMemoryGraphError::MissingNode))?;
+            self.scratch_data.extend(
+                row.neighbours
+                    .iter()
+                    .filter(|(neighbour, _)| coreset_members.contains(neighbour))
+                    .map(|(&neighbour, &weight)| (neighbour, weight)),
+            );
+            self.scratch_offsets.push(self.scratch_data.len());
         }
 
-        Ok(self.scratch_rows.iter().map(Vec::as_slice).collect())
+        Ok(Neighbourhoods::new(
+            &self.scratch_data,
+            &self.scratch_offsets,
+        ))
     }
 }

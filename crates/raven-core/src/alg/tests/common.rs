@@ -3,10 +3,10 @@ use std::sync::Arc;
 use rustc_hash::FxHashSet;
 
 use crate::{
-    DynamicClusteringAlg, GraphOracle,
     alg::{DynamicClustering, ResizeQueryInfo},
     error::OracleError,
-    types::{AlgType, Strict, TreeIndex, Volume},
+    types::{AlgType, Neighbourhoods, Strict, TreeIndex, Volume},
+    DynamicClusteringAlg, GraphOracle,
 };
 
 pub(crate) type TestClustering = DynamicClustering<2, usize, f64>;
@@ -77,37 +77,47 @@ pub(crate) fn apply_size_volume_updates(
     });
 }
 
-pub(crate) struct EmptyOracle;
-
-type EmptyOracleWeightedNodes = [(usize, Strict<f64>)];
+pub(crate) struct EmptyOracle {
+    offsets: Vec<usize>,
+}
 
 impl EmptyOracle {
     pub(crate) fn new() -> Self {
-        Self
+        Self {
+            offsets: Vec::new(),
+        }
     }
 
     fn empty_rows<'a>(
-        &mut self,
-        nodes: &'a [usize],
-    ) -> Result<Vec<&'a EmptyOracleWeightedNodes>, OracleError<String>> {
-        static EMPTY_NEIGHBOURS: &EmptyOracleWeightedNodes = &[];
-
-        Ok(vec![EMPTY_NEIGHBOURS; nodes.len()])
+        &'a mut self,
+        nodes: &[usize],
+    ) -> Result<Neighbourhoods<'a, usize, f64>, OracleError<String>> {
+        self.offsets.clear();
+        self.offsets.resize(nodes.len() + 1, 0);
+        Ok(Neighbourhoods::new(&[], &self.offsets))
     }
 }
 
 impl GraphOracle<usize, f64, String> for EmptyOracle {
     fn graph_neighbourhoods<'a>(
         &'a mut self,
-        nodes: &'a [usize],
-    ) -> Result<Vec<&'a [(usize, Strict<f64>)]>, OracleError<String>> {
+        nodes: &[usize],
+    ) -> Result<Neighbourhoods<'a, usize, f64>, OracleError<String>> {
         self.empty_rows(nodes)
+    }
+
+    fn graph_neighbourhoods_intersecting<'a>(
+        &'a mut self,
+        sources: &[usize],
+        _targets: &[usize],
+    ) -> Result<Neighbourhoods<'a, usize, f64>, OracleError<String>> {
+        self.empty_rows(sources)
     }
 
     fn coreset_neighbourhoods<'a>(
         &'a mut self,
-        nodes: &'a [usize],
-    ) -> Result<Vec<&'a [(usize, Strict<f64>)]>, OracleError<String>> {
+        nodes: &[usize],
+    ) -> Result<Neighbourhoods<'a, usize, f64>, OracleError<String>> {
         self.empty_rows(nodes)
     }
 }

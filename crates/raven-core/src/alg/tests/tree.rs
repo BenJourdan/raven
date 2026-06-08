@@ -4,9 +4,9 @@ use rustc_hash::FxHashSet;
 
 use super::common::*;
 use crate::{
-    DynamicClusteringAlg,
     alg::DynamicClustering,
     types::{NodeDegree, TreeIndex},
+    DynamicClusteringAlg,
 };
 
 #[test]

@@ -1,6 +1,49 @@
+use num_traits::Float as _;
 use rustc_hash::FxHashSet;
 
-use crate::types::TreeIndex;
+use crate::types::{FDelta, FloatScalar, NonStrict, NonStrictCarrierOps, TreeIndex, HB, HS};
+
+/// Query-time tree values whose invariants are preserved by summing children.
+///
+/// This is deliberately narrower than `Sum`: these scratch quantities are
+/// non-negative finite by construction, so hot tree recomputation can validate
+/// the invariant in debug builds and avoid repeated checked wrapper creation in
+/// release builds.
+pub(crate) trait NonStrictTreeValue: Copy {
+    type Scalar: FloatScalar;
+
+    fn into_scalar(self) -> Self::Scalar;
+
+    /// # Safety
+    /// `x` must be non-negative and finite.
+    unsafe fn from_scalar_unchecked(x: Self::Scalar) -> Self;
+}
+
+macro_rules! impl_non_strict_tree_value {
+    ($($name:ident),* $(,)?) => {
+        $(
+            impl<T> NonStrictTreeValue for $name<T>
+            where
+                T: FloatScalar,
+                NonStrict<T>: NonStrictCarrierOps<Scalar = T>,
+            {
+                type Scalar = T;
+
+                #[inline(always)]
+                fn into_scalar(self) -> Self::Scalar {
+                    $name::<T>::into_scalar(self)
+                }
+
+                #[inline(always)]
+                unsafe fn from_scalar_unchecked(x: Self::Scalar) -> Self {
+                    unsafe { $name::<T>::from_scalar_unchecked(x) }
+                }
+            }
+        )*
+    };
+}
+
+impl_non_strict_tree_value!(FDelta, HB, HS);
 
 /// Shared zero-sized helper struct for tree layout calculations.
 pub(crate) struct TreeLayout<const ARITY: usize>;
@@ -103,5 +146,42 @@ impl<const ARITY: usize> TreeLayout<ARITY> {
                 }
             })
             .sum();
+    }
+
+    #[inline(always)]
+    pub fn one_step_recompute_non_strict_with_timestamp<X, F>(
+        parent: TreeIndex,
+        tree: &mut [X],
+        timestamps: &[usize],
+        cur_timestamp: usize,
+        mut fallback: F,
+    ) where
+        X: NonStrictTreeValue,
+        F: FnMut(TreeIndex) -> X,
+    {
+        let start = parent.0 * ARITY + 1;
+        if start >= tree.len() {
+            return;
+        }
+        let end = (start + ARITY).min(tree.len());
+
+        let mut total = X::Scalar::ZERO;
+        for idx in start..end {
+            let value = if timestamps[idx] == cur_timestamp {
+                tree[idx]
+            } else {
+                fallback(TreeIndex(idx))
+            };
+            total = total + value.into_scalar();
+        }
+
+        debug_assert!(
+            total.is_finite() && total >= X::Scalar::ZERO,
+            "sum of non-strict tree values must stay non-negative and finite"
+        );
+
+        // SAFETY: all inputs are non-negative finite query-time quantities.
+        // Addition preserves non-negativity; debug builds check finiteness.
+        tree[parent] = unsafe { X::from_scalar_unchecked(total) };
     }
 }
