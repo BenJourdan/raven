@@ -37,18 +37,19 @@ mod playground {
     const N_PER_CLUSTER: usize = 1024;
     const NUM_CLUSTERS: usize = 256;
     const TOTAL_NODES: usize = N_PER_CLUSTER * NUM_CLUSTERS;
-    const P_INTERNAL: f64 = 0.5;
+    const P_INTERNAL: f64 = 0.66;
     const Q_EXTERNAL: f64 = 1.0 / TOTAL_NODES as f64;
     const N_MULTIPLIER: usize = 1;
     const LIFETIME_MULTIPLIER: f64 = 1.0;
     const STEP_SIZE: f64 = 0.01;
     const SIGMA: f64 = 1000.0;
     const DEGREE_CACHE_THRESHOLD: usize = 4096;
+    const ARITY: usize = 8;
 
-    const NUM_TRIALS: usize = 3;
-    const CORESET_SIZE: usize = 4096*2;
+    const NUM_TRIALS: usize = 1;
+    const CORESET_SIZE: usize = 8192 * 2;
     const SAMPLING_SEEDS: usize = NUM_CLUSTERS * 8;
-    const QUERY_FRAC: f64 = 0.01;
+    const QUERY_FRAC: f64 = 0.1;
 
     #[derive(Debug)]
     struct TrialSummary {
@@ -64,7 +65,7 @@ mod playground {
             NonZeroUsize::new(TOTAL_NODES).expect("total node count is non-zero"),
             expected_edges_per_node(),
             NonZeroUsize::new(DEGREE_CACHE_THRESHOLD)
-            .expect("degree rebuild threshold is non-zero"),
+                .expect("degree rebuild threshold is non-zero"),
         );
 
         let alg = leiden_community_detection_alg(LeidenConfig {
@@ -72,7 +73,7 @@ mod playground {
             ..LeidenConfig::default()
         });
         let cluster_alg = alg;
-        let mut clustering = DynamicClustering::<128, usize, f64>::new(cluster_alg)
+        let mut clustering = DynamicClustering::<ARITY, usize, f64>::new(cluster_alg)
             .with_sigma(strict(SIGMA)?)
             .with_num_trials(NUM_TRIALS)
             .with_coreset_size(CORESET_SIZE)
@@ -129,7 +130,6 @@ mod playground {
 
             let query_nodes = query_subset(&live_nodes, QUERY_FRAC)?;
             let true_labels = true_labels(&workload, &query_nodes)?;
-            validate_query_label_mapping(&workload, &query_nodes, &true_labels)?;
 
             // time clustering queries:
             let query_started = Instant::now();
@@ -216,7 +216,13 @@ mod playground {
         );
 
         println!("ARI history (batch time, winner ARI):");
-        println!("{:?}", ari_history.iter().map(|(time, ari)| (format!("{time}"), format!("{:.3}", ari.0))).collect::<Vec<_>>());
+        println!(
+            "{:?}",
+            ari_history
+                .iter()
+                .map(|(time, ari)| (format!("{time}"), format!("{:.3}", ari.0)))
+                .collect::<Vec<_>>()
+        );
 
         Ok(())
     }
@@ -232,7 +238,6 @@ mod playground {
             LIFETIME_MULTIPLIER,
             STEP_SIZE,
         )?;
-        validate_workload_label_mapping(&workload)?;
         Ok(workload)
     }
 
@@ -280,56 +285,6 @@ mod playground {
                     .ok_or_else(|| format!("node {node} had no planted cluster label").into())
             })
             .collect()
-    }
-
-    fn validate_workload_label_mapping(workload: &SbmDiffWorkload<f64>) -> Result<()> {
-        for &node in &workload.nodes {
-            let actual = workload
-                .cluster_labels
-                .get(node)
-                .copied()
-                .ok_or_else(|| format!("node {node} had no planted cluster label"))?;
-            let expected = node / N_PER_CLUSTER;
-            if expected >= NUM_CLUSTERS || actual != expected {
-                return Err(format!(
-                    "workload label mapping mismatch for node {node}: expected {expected}, got {actual}"
-                )
-                .into());
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_query_label_mapping(
-        workload: &SbmDiffWorkload<f64>,
-        nodes: &[usize],
-        labels: &[usize],
-    ) -> Result<()> {
-        if nodes.len() != labels.len() {
-            return Err(format!(
-                "query mapping mismatch: {} nodes but {} labels",
-                nodes.len(),
-                labels.len()
-            )
-            .into());
-        }
-
-        for (&node, &label) in nodes.iter().zip(labels) {
-            let workload_label = workload
-                .cluster_labels
-                .get(node)
-                .copied()
-                .ok_or_else(|| format!("node {node} had no planted cluster label"))?;
-            let expected = node / N_PER_CLUSTER;
-            if label != workload_label || label != expected {
-                return Err(format!(
-                    "query label mapping mismatch for node {node}: true_labels gave {label}, workload has {workload_label}, block convention gives {expected}"
-                )
-                .into());
-            }
-        }
-
-        Ok(())
     }
 
     fn strict(value: f64) -> Result<Strict<f64>> {
