@@ -4,10 +4,10 @@ use rand::RngExt;
 
 use super::common::*;
 use crate::{
-    alg::{coreset_impls::Coreset, QueryTime, ResizeQueryInfo, RngMode, TrialWorkspace},
+    DynamicClusteringAlg, GraphOracle,
+    alg::{QueryTime, ResizeQueryInfo, RngMode, TrialWorkspace, coreset_impls::Coreset},
     error::{DynamicCoresetError, OracleError},
     types::{Neighbourhoods, PartitionOutput, PartitionType, TrialObjective, TrialOutputMode},
-    DynamicClusteringAlg, GraphOracle,
 };
 
 struct IntersectOnlyEmptyOracle {
@@ -105,9 +105,10 @@ fn query_rejects_oracle_count_mismatch() {
     )
     .unwrap_err();
 
-    assert!(err
-        .to_string()
-        .contains("expected 2 oracles for 2 trials, but got 1"));
+    assert!(
+        err.to_string()
+            .contains("expected 2 oracles for 2 trials, but got 1")
+    );
 }
 
 #[test]
@@ -124,9 +125,10 @@ fn query_rejects_stale_update_resize_scratch_lengths() {
     )
     .unwrap_err();
 
-    assert!(err
-        .to_string()
-        .contains("query time arrays are not the right length"));
+    assert!(
+        err.to_string()
+            .contains("query time arrays are not the right length")
+    );
 }
 
 #[test]
@@ -163,9 +165,10 @@ fn query_rejects_wrong_cluster_label_count() {
     )
     .unwrap_err();
 
-    assert!(err
-        .to_string()
-        .contains("cluster algorithm returned 0 labels"));
+    assert!(
+        err.to_string()
+            .contains("cluster algorithm returned 0 labels")
+    );
 }
 
 #[test]
@@ -376,10 +379,12 @@ fn query_all_trials_returns_one_partition_per_trial() {
                 assert_eq!(trial.trial_index, expected_idx);
                 assert_eq!(trial.num_clusters, 1);
                 assert_eq!(trial.labels.len(), nodes.len());
-                assert!(trial
-                    .scores
-                    .as_ref()
-                    .is_some_and(|scores| scores.len() == nodes.len()));
+                assert!(
+                    trial
+                        .scores
+                        .as_ref()
+                        .is_some_and(|scores| scores.len() == nodes.len())
+                );
             }
         }
         PartitionOutput::Subset(_) => panic!("expected all-node partition output"),
@@ -408,10 +413,12 @@ fn query_subset_all_trials_returns_one_partition_per_trial() {
                 assert_eq!(trial.trial_index, expected_idx);
                 assert_eq!(trial.num_clusters, 1);
                 assert_eq!(trial.labels.len(), subset.len());
-                assert!(trial
-                    .scores
-                    .as_ref()
-                    .is_some_and(|scores| scores.len() == subset.len()));
+                assert!(
+                    trial
+                        .scores
+                        .as_ref()
+                        .is_some_and(|scores| scores.len() == subset.len())
+                );
             }
         }
         PartitionOutput::All(_, _) => panic!("expected subset partition output"),

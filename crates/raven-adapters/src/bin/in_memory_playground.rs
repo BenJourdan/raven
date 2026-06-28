@@ -13,7 +13,11 @@ fn main() {
 
 #[cfg(feature = "bench-clustering")]
 mod playground {
-    use std::{error::Error, num::NonZeroUsize, time::Instant};
+    use std::{
+        error::Error,
+        num::NonZeroUsize,
+        time::{Duration, Instant},
+    };
 
     use rand::{RngExt, SeedableRng};
     use raven_adapters::in_memory::{
@@ -21,11 +25,12 @@ mod playground {
         workloads::{SbmDiffWorkload, prepare_diff_workload_sbm},
     };
     use raven_core::{
-        DynamicClusteringAlg,
-        alg::{DynamicClustering, ResizeQueryInfo},
+        DynamicClusteringAlg, GraphOracle,
+        alg::{DynamicClustering, QueryTiming, ResizeQueryInfo},
         clustering::{LeidenConfig, leiden_community_detection_alg},
+        error::OracleError,
         metrics::adjusted_rand_index,
-        types::{PartitionOutput, PartitionType, Strict, TrialOutputMode},
+        types::{Neighbourhoods, PartitionOutput, PartitionType, Strict, TrialOutputMode},
     };
 
     use indicatif::{ProgressBar, ProgressStyle};
@@ -47,8 +52,8 @@ mod playground {
     const ARITY: usize = 8;
 
     const NUM_TRIALS: usize = 1;
-    const CORESET_SIZE: usize = 8192 * 2;
-    const SAMPLING_SEEDS: usize = NUM_CLUSTERS * 8;
+    const CORESET_SIZE: usize = 8192;
+    const SAMPLING_SEEDS: usize = NUM_CLUSTERS * 4;
     const QUERY_FRAC: f64 = 0.1;
 
     #[derive(Debug)]
@@ -57,6 +62,165 @@ mod playground {
         ari: f64,
         score: f64,
         num_clusters: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct QueryTimingTotals {
+        queries: usize,
+        wall: Duration,
+        setup: Duration,
+        output: Duration,
+        trial_total: Duration,
+        trial_critical_path: Duration,
+        extract_coreset: Duration,
+        build_coreset_graph: Duration,
+        cluster_coreset: Duration,
+        label_partition: Duration,
+    }
+
+    #[derive(Debug, Default, Clone, Copy)]
+    struct OracleTiming {
+        graph_calls: usize,
+        graph_sources: usize,
+        graph_edges: usize,
+        graph_time: Duration,
+        intersecting_calls: usize,
+        intersecting_sources: usize,
+        intersecting_targets: usize,
+        intersecting_edges: usize,
+        intersecting_time: Duration,
+        coreset_calls: usize,
+        coreset_sources: usize,
+        coreset_edges: usize,
+        coreset_time: Duration,
+    }
+
+    #[derive(Debug)]
+    struct TimedOracle<O> {
+        inner: O,
+        timing: OracleTiming,
+    }
+
+    impl<O> TimedOracle<O> {
+        fn new(inner: O) -> Self {
+            Self {
+                inner,
+                timing: OracleTiming::default(),
+            }
+        }
+    }
+
+    impl QueryTimingTotals {
+        fn add(&mut self, timing: &QueryTiming) {
+            self.queries += 1;
+            self.wall += timing.total;
+            self.setup += timing.setup;
+            self.output += timing.output;
+
+            let mut critical_path = Duration::ZERO;
+            for trial in &timing.trials {
+                self.trial_total += trial.total;
+                self.extract_coreset += trial.extract_coreset;
+                self.build_coreset_graph += trial.build_coreset_graph;
+                self.cluster_coreset += trial.cluster_coreset;
+                self.label_partition += trial.label_partition;
+                critical_path = critical_path.max(trial.total);
+            }
+            self.trial_critical_path += critical_path;
+        }
+    }
+
+    impl OracleTiming {
+        fn add(&mut self, other: Self) {
+            self.graph_calls += other.graph_calls;
+            self.graph_sources += other.graph_sources;
+            self.graph_edges += other.graph_edges;
+            self.graph_time += other.graph_time;
+
+            self.intersecting_calls += other.intersecting_calls;
+            self.intersecting_sources += other.intersecting_sources;
+            self.intersecting_targets += other.intersecting_targets;
+            self.intersecting_edges += other.intersecting_edges;
+            self.intersecting_time += other.intersecting_time;
+
+            self.coreset_calls += other.coreset_calls;
+            self.coreset_sources += other.coreset_sources;
+            self.coreset_edges += other.coreset_edges;
+            self.coreset_time += other.coreset_time;
+        }
+
+        fn total_time(self) -> Duration {
+            self.graph_time + self.intersecting_time + self.coreset_time
+        }
+    }
+
+    impl<V, T, E, O> GraphOracle<V, T, E> for TimedOracle<O>
+    where
+        O: GraphOracle<V, T, E>,
+    {
+        fn graph_neighbourhoods<'a>(
+            &'a mut self,
+            nodes: &[V],
+        ) -> std::result::Result<Neighbourhoods<'a, V, T>, OracleError<E>> {
+            let started = Instant::now();
+            let result = self.inner.graph_neighbourhoods(nodes);
+            let elapsed = started.elapsed();
+            let edges = result
+                .as_ref()
+                .map(Neighbourhoods::data)
+                .map_or(0, |data| data.len());
+
+            self.timing.graph_calls += 1;
+            self.timing.graph_sources += nodes.len();
+            self.timing.graph_edges += edges;
+            self.timing.graph_time += elapsed;
+
+            result
+        }
+
+        fn graph_neighbourhoods_intersecting<'a>(
+            &'a mut self,
+            sources: &[V],
+            targets: &[V],
+        ) -> std::result::Result<Neighbourhoods<'a, V, T>, OracleError<E>> {
+            let started = Instant::now();
+            let result = self
+                .inner
+                .graph_neighbourhoods_intersecting(sources, targets);
+            let elapsed = started.elapsed();
+            let edges = result
+                .as_ref()
+                .map(Neighbourhoods::data)
+                .map_or(0, |data| data.len());
+
+            self.timing.intersecting_calls += 1;
+            self.timing.intersecting_sources += sources.len();
+            self.timing.intersecting_targets += targets.len();
+            self.timing.intersecting_edges += edges;
+            self.timing.intersecting_time += elapsed;
+
+            result
+        }
+
+        fn coreset_neighbourhoods<'a>(
+            &'a mut self,
+            nodes: &[V],
+        ) -> std::result::Result<Neighbourhoods<'a, V, T>, OracleError<E>> {
+            let started = Instant::now();
+            let result = self.inner.coreset_neighbourhoods(nodes);
+            let elapsed = started.elapsed();
+            let edges = result
+                .as_ref()
+                .map(Neighbourhoods::data)
+                .map_or(0, |data| data.len());
+
+            self.timing.coreset_calls += 1;
+            self.timing.coreset_sources += nodes.len();
+            self.timing.coreset_edges += edges;
+            self.timing.coreset_time += elapsed;
+
+            result
+        }
     }
 
     pub fn run() -> Result<()> {
@@ -101,6 +265,9 @@ mod playground {
         let mut node_ops_time = 0;
         let mut data_structure_update_time = 0;
         let mut data_structure_query_time = 0;
+        let mut query_timing_totals = QueryTimingTotals::default();
+        let mut oracle_timing_totals = OracleTiming::default();
+        let mut queried_nodes_total = 0usize;
 
         for (batch_idx, batch) in workload.batches.iter().enumerate() {
             // time graph updates:
@@ -129,12 +296,17 @@ mod playground {
             }
 
             let query_nodes = query_subset(&live_nodes, QUERY_FRAC)?;
+            queried_nodes_total += query_nodes.len();
             let true_labels = true_labels(&workload, &query_nodes)?;
 
             // time clustering queries:
             let query_started = Instant::now();
 
-            let mut oracles = graph.oracles(NUM_TRIALS);
+            let oracles = graph.oracles(NUM_TRIALS);
+            let mut oracles = oracles
+                .into_iter()
+                .map(TimedOracle::new)
+                .collect::<Vec<_>>();
             let mut oracle_refs = oracles.iter_mut().collect::<Vec<_>>();
 
             let output = clustering.query(
@@ -143,6 +315,12 @@ mod playground {
                 &mut oracle_refs,
             )?;
             data_structure_query_time += query_started.elapsed().as_micros();
+            if let Some(timing) = clustering.last_query_timing() {
+                query_timing_totals.add(timing);
+            }
+            for oracle in &oracles {
+                oracle_timing_totals.add(oracle.timing);
+            }
             let summaries = trial_summaries_for_output(&true_labels, &output);
             let aris_scores = summaries
                 .iter()
@@ -213,6 +391,11 @@ mod playground {
         println!(
             "  data structure queries: {:.3} seconds",
             data_structure_query_time as f64 / 1_000_000.0
+        );
+        print_query_timing_breakdown(
+            &query_timing_totals,
+            &oracle_timing_totals,
+            queried_nodes_total,
         );
 
         println!("ARI history (batch time, winner ARI):");
@@ -316,5 +499,142 @@ mod playground {
             "#{}  ari={:.6} score={:.6}, k={}",
             summary.trial_index, summary.ari, summary.score, summary.num_clusters
         )
+    }
+
+    fn print_query_timing_breakdown(
+        query_timing: &QueryTimingTotals,
+        oracle_timing: &OracleTiming,
+        queried_nodes_total: usize,
+    ) {
+        if query_timing.queries == 0 {
+            println!("Query timing breakdown: no queries ran");
+            return;
+        }
+
+        let queries = query_timing.queries;
+        let avg_query_nodes = queried_nodes_total as f64 / queries as f64;
+
+        println!("Query timing breakdown:");
+        println!(
+            "  profiled query wall: {:.3} seconds ({:.3} ms/query, avg query nodes {:.1})",
+            seconds(query_timing.wall),
+            millis_per_query(query_timing.wall, queries),
+            avg_query_nodes
+        );
+        println!(
+            "  setup/validation: {:.3} seconds ({:.1}% of wall)",
+            seconds(query_timing.setup),
+            percent(query_timing.setup, query_timing.wall)
+        );
+        println!(
+            "  trial critical path: {:.3} seconds ({:.1}% of wall)",
+            seconds(query_timing.trial_critical_path),
+            percent(query_timing.trial_critical_path, query_timing.wall)
+        );
+        println!(
+            "  output shaping: {:.3} seconds ({:.1}% of wall)",
+            seconds(query_timing.output),
+            percent(query_timing.output, query_timing.wall)
+        );
+        println!(
+            "  summed trial work: {:.3} seconds ({:.3} ms/query)",
+            seconds(query_timing.trial_total),
+            millis_per_query(query_timing.trial_total, queries)
+        );
+        println!(
+            "    coreset extraction: {:.3} seconds ({:.1}% of trial work)",
+            seconds(query_timing.extract_coreset),
+            percent(query_timing.extract_coreset, query_timing.trial_total)
+        );
+        println!(
+            "    coreset graph build: {:.3} seconds ({:.1}% of trial work)",
+            seconds(query_timing.build_coreset_graph),
+            percent(query_timing.build_coreset_graph, query_timing.trial_total)
+        );
+        println!(
+            "    coreset clustering: {:.3} seconds ({:.1}% of trial work)",
+            seconds(query_timing.cluster_coreset),
+            percent(query_timing.cluster_coreset, query_timing.trial_total)
+        );
+        println!(
+            "    partition labelling: {:.3} seconds ({:.1}% of trial work)",
+            seconds(query_timing.label_partition),
+            percent(query_timing.label_partition, query_timing.trial_total)
+        );
+
+        let oracle_total = oracle_timing.total_time();
+        println!(
+            "  oracle calls: {:.3} seconds ({:.1}% of trial work)",
+            seconds(oracle_total),
+            percent(oracle_total, query_timing.trial_total)
+        );
+        print_oracle_row(
+            "graph_neighbourhoods",
+            oracle_timing.graph_calls,
+            oracle_timing.graph_sources,
+            None,
+            oracle_timing.graph_edges,
+            oracle_timing.graph_time,
+        );
+        print_oracle_row(
+            "graph_neighbourhoods_intersecting",
+            oracle_timing.intersecting_calls,
+            oracle_timing.intersecting_sources,
+            Some(oracle_timing.intersecting_targets),
+            oracle_timing.intersecting_edges,
+            oracle_timing.intersecting_time,
+        );
+        print_oracle_row(
+            "coreset_neighbourhoods",
+            oracle_timing.coreset_calls,
+            oracle_timing.coreset_sources,
+            None,
+            oracle_timing.coreset_edges,
+            oracle_timing.coreset_time,
+        );
+    }
+
+    fn print_oracle_row(
+        name: &str,
+        calls: usize,
+        sources: usize,
+        targets: Option<usize>,
+        edges: usize,
+        duration: Duration,
+    ) {
+        match targets {
+            Some(targets) => println!(
+                "    {name}: {:.3}s, calls={}, sources={}, targets={}, returned_edges={}",
+                seconds(duration),
+                calls,
+                sources,
+                targets,
+                edges
+            ),
+            None => println!(
+                "    {name}: {:.3}s, calls={}, sources={}, returned_edges={}",
+                seconds(duration),
+                calls,
+                sources,
+                edges
+            ),
+        }
+    }
+
+    fn seconds(duration: Duration) -> f64 {
+        duration.as_secs_f64()
+    }
+
+    fn millis_per_query(duration: Duration, queries: usize) -> f64 {
+        duration.as_secs_f64() * 1_000.0 / queries.max(1) as f64
+    }
+
+    fn percent(part: Duration, total: Duration) -> f64 {
+        let total = total.as_secs_f64();
+        if total == 0.0 {
+            0.0
+        } else {
+            part.as_secs_f64() * 100.0 / total
+        }
     }
 }

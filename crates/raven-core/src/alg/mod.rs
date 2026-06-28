@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use priority_queue::PriorityQueue;
 use rand::SeedableRng;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -12,7 +14,7 @@ mod workspace;
 #[cfg(test)]
 mod tests;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 use crate::types::{
     AlgType, Contribution, FloatScalar, NodeDegree, NonStrict, NonStrictCarrierOps, Strict,
@@ -80,6 +82,24 @@ pub struct DynamicClustering<const ARITY: usize, V, T> {
     pub num_clusters: usize,
     pub cluster_alg: AlgType<T>,
     pub prop_name: String,
+    last_query_timing: Option<QueryTiming>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct QueryTiming {
+    pub total: Duration,
+    pub setup: Duration,
+    pub output: Duration,
+    pub trials: Vec<QueryTrialTiming>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct QueryTrialTiming {
+    pub total: Duration,
+    pub extract_coreset: Duration,
+    pub build_coreset_graph: Duration,
+    pub cluster_coreset: Duration,
+    pub label_partition: Duration,
 }
 
 // Holds info for coreset construction.
@@ -138,7 +158,12 @@ where
             num_clusters: 10,
             cluster_alg,
             prop_name: "unknown".to_string(),
+            last_query_timing: None,
         }
+    }
+
+    pub fn last_query_timing(&self) -> Option<&QueryTiming> {
+        self.last_query_timing.as_ref()
     }
 
     pub fn with_sigma(mut self, sigma: Strict<T>) -> Self {

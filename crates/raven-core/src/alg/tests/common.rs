@@ -3,10 +3,10 @@ use std::sync::Arc;
 use rustc_hash::FxHashSet;
 
 use crate::{
+    DynamicClusteringAlg, GraphOracle,
     alg::{DynamicClustering, ResizeQueryInfo},
     error::OracleError,
     types::{AlgType, Neighbourhoods, Strict, TreeIndex, Volume},
-    DynamicClusteringAlg, GraphOracle,
 };
 
 pub(crate) type TestClustering = DynamicClustering<2, usize, f64>;

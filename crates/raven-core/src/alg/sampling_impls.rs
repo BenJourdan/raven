@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use itertools::izip;
 use rand::RngExt;
 
 use super::{SamplingInfo, TreeLayout, TrialWorkspace};
 use crate::types::{
-    Contribution, EdgeWeight, FDelta, FloatScalar, NodeDegree, NonStrict, NonStrictCarrierOps,
-    SmoothedContribution, Strict, StrictCarrierOps, TreeIndex, HB, HS,
+    Contribution, EdgeWeight, FDelta, FloatScalar, HB, HS, NodeDegree, NonStrict,
+    NonStrictCarrierOps, SmoothedContribution, Strict, StrictCarrierOps, TreeIndex,
 };
 
 impl<const ARITY: usize, V, T> TrialWorkspace<'_, ARITY, V, T>

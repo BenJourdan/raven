@@ -1,6 +1,6 @@
 use std::num::NonZero;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use faer::sparse::{SparseRowMat, SymbolicSparseRowMat};
 use rand::RngExt;
 use rayon::prelude::*;
@@ -8,12 +8,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{SamplingInfo, TreeLayout, TrialWorkspace};
 use crate::{
+    GraphOracle,
     error::DynamicCoresetError,
     types::{
-        Contribution, EdgeWeight, FDelta, FloatScalar, Neighbourhoods, NodeDegree, NonStrict,
-        NonStrictCarrierOps, Strict, StrictCarrierOps, TreeIndex, HB, HS,
+        Contribution, EdgeWeight, FDelta, FloatScalar, HB, HS, Neighbourhoods, NodeDegree,
+        NonStrict, NonStrictCarrierOps, Strict, StrictCarrierOps, TreeIndex,
     },
-    GraphOracle,
 };
 
 pub struct Coreset<V, T> {

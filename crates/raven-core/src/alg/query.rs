@@ -1,17 +1,17 @@
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, time::Instant};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
-use super::{DynamicClustering, ResizeQueryInfo, TrialWorkspace};
+use super::{DynamicClustering, QueryTiming, QueryTrialTiming, ResizeQueryInfo, TrialWorkspace};
 use crate::{
+    DynamicClusteringAlg, GraphOracle,
     error::DynamicCoresetError,
     types::{
         FloatScalar, NonStrict, NonStrictCarrierOps, PartitionOutput, PartitionType, Strict,
         StrictCarrierOps, TrialObjective, TrialOutputMode, TrialPartition,
     },
-    DynamicClusteringAlg, GraphOracle,
 };
 
 impl<const ARITY: usize, V, T> DynamicClusteringAlg<V, T> for DynamicClustering<ARITY, V, T>
@@ -47,6 +47,9 @@ where
         O: GraphOracle<V, T, E> + ?Sized + Send,
         E: std::fmt::Display,
     {
+        let query_started = Instant::now();
+        self.last_query_timing = None;
+
         if self.tree_data.persistent.size.is_empty() {
             return Err(DynamicCoresetError::NoData.into());
         }
@@ -146,14 +149,18 @@ where
             }
             PartitionType::Subset(_) => None,
         };
+        let setup = query_started.elapsed();
 
-        let labels_scores_clusters = self
+        let trial_results = self
             .tree_data
             .query_time
             .par_iter_mut()
             .zip(oracles.par_iter_mut())
             .enumerate()
             .map(|(trial_index, (query_time, oracle))| -> Result<_> {
+                let trial_started = Instant::now();
+                let mut timing = QueryTrialTiming::default();
+
                 let mut context = TrialWorkspace::<ARITY, _, _> {
                     timestamp,
                     persistent,
@@ -162,6 +169,8 @@ where
                     tree_to_node_map,
                 };
                 let mut rng = rng_mode.rng_for_trial(trial_index);
+
+                let extract_started = Instant::now();
                 let mut coreset = context.extract_coreset_trial(
                     &mut **oracle,
                     sigma,
@@ -171,10 +180,17 @@ where
                     sampling_seeds,
                     &mut rng,
                 )?;
+                timing.extract_coreset = extract_started.elapsed();
+
+                let build_started = Instant::now();
                 let mut coreset_graph =
                     context.build_coreset_graph(&coreset, &mut **oracle, sigma)?;
+                timing.build_coreset_graph = build_started.elapsed();
+
+                let cluster_started = Instant::now();
                 let (coreset_labels, num_clusters) =
                     (cluster_alg)(&mut coreset_graph, requested_num_clusters);
+                timing.cluster_coreset = cluster_started.elapsed();
 
                 if coreset_labels.len() != coreset.nodes.len() {
                     return Err(anyhow!(
@@ -185,6 +201,7 @@ where
                 }
                 coreset.coreset_labels = Some(coreset_labels);
 
+                let label_started = Instant::now();
                 let (labels, scores) = match partition {
                     PartitionType::All => {
                         let (_nodes, labels, scores) = context.rust_label_full_graph(
@@ -207,12 +224,24 @@ where
                         (labels, scores)
                     }
                 };
+                timing.label_partition = label_started.elapsed();
+                timing.total = trial_started.elapsed();
 
-                Ok((labels, scores, num_clusters))
+                Ok((labels, scores, num_clusters, timing))
             })
             .collect::<Result<Vec<_>>>()?;
 
-        if let TrialOutputMode::Winner(objective) = trial_output_mode {
+        let mut trial_timings = Vec::with_capacity(trial_results.len());
+        let labels_scores_clusters = trial_results
+            .into_iter()
+            .map(|(labels, scores, num_clusters, timing)| {
+                trial_timings.push(timing);
+                (labels, scores, num_clusters)
+            })
+            .collect::<Vec<_>>();
+
+        let output_started = Instant::now();
+        let output = if let TrialOutputMode::Winner(objective) = trial_output_mode {
             let best_idx = match objective {
                 TrialObjective::KernelDistance => {
                     // choose the trial with the smallest sum of centroid distances as the winner.
@@ -239,7 +268,7 @@ where
                         scores: None, // don't need the scores since there is only one trial.
                         num_clusters: labels_scores_clusters[best_idx].2,
                     };
-                    return Ok(PartitionOutput::All(node_names.unwrap(), vec![trial_part]));
+                    PartitionOutput::All(node_names.unwrap(), vec![trial_part])
                 }
                 PartitionType::Subset(_nodes) => {
                     // Similar but we don't need to include the nodes since the order was specified by the input subset.
@@ -249,38 +278,44 @@ where
                         scores: None, // don't need the scores since there is only one trial.
                         num_clusters: labels_scores_clusters[best_idx].2,
                     };
-                    return Ok(PartitionOutput::Subset(vec![trial_part]));
+                    PartitionOutput::Subset(vec![trial_part])
                 }
             }
-        }
+        } else {
+            // We return all the trial partitions. The caller decides what to do with them.
+            match partition {
+                PartitionType::All => {
+                    let trial_parts = labels_scores_clusters.into_iter().enumerate().map(
+                        |(idx, (labels, scores, num_clusters))| TrialPartition {
+                            trial_index: idx,
+                            labels,
+                            scores: Some(scores),
+                            num_clusters,
+                        },
+                    );
+                    PartitionOutput::All(node_names.unwrap(), trial_parts.collect())
+                }
+                PartitionType::Subset(_nodes) => {
+                    let trial_parts = labels_scores_clusters.into_iter().enumerate().map(
+                        |(idx, (labels, scores, num_clusters))| TrialPartition {
+                            trial_index: idx,
+                            labels,
+                            scores: Some(scores),
+                            num_clusters,
+                        },
+                    );
+                    PartitionOutput::Subset(trial_parts.collect())
+                }
+            }
+        };
 
-        // We return all the trial partitions. The caller decides what to do with them.
-        match partition {
-            PartitionType::All => {
-                let trial_parts = labels_scores_clusters.into_iter().enumerate().map(
-                    |(idx, (labels, scores, num_clusters))| TrialPartition {
-                        trial_index: idx,
-                        labels,
-                        scores: Some(scores),
-                        num_clusters,
-                    },
-                );
-                Ok(PartitionOutput::All(
-                    node_names.unwrap(),
-                    trial_parts.collect(),
-                ))
-            }
-            PartitionType::Subset(_nodes) => {
-                let trial_parts = labels_scores_clusters.into_iter().enumerate().map(
-                    |(idx, (labels, scores, num_clusters))| TrialPartition {
-                        trial_index: idx,
-                        labels,
-                        scores: Some(scores),
-                        num_clusters,
-                    },
-                );
-                Ok(PartitionOutput::Subset(trial_parts.collect()))
-            }
-        }
+        self.last_query_timing = Some(QueryTiming {
+            total: query_started.elapsed(),
+            setup,
+            output: output_started.elapsed(),
+            trials: trial_timings,
+        });
+
+        Ok(output)
     }
 }

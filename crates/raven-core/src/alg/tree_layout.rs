@@ -1,7 +1,7 @@
 use num_traits::Float as _;
 use rustc_hash::FxHashSet;
 
-use crate::types::{FDelta, FloatScalar, NonStrict, NonStrictCarrierOps, TreeIndex, HB, HS};
+use crate::types::{FDelta, FloatScalar, HB, HS, NonStrict, NonStrictCarrierOps, TreeIndex};
 
 /// Query-time tree values whose invariants are preserved by summing children.
 ///
