@@ -141,6 +141,10 @@ where
         self.graph.contains_key(&node)
     }
 
+    pub fn node_count(&self) -> usize {
+        self.graph.len()
+    }
+
     pub fn node_ops_buffer_len(&self) -> usize {
         self.node_ops.len()
     }

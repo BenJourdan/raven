@@ -8,7 +8,7 @@ use raven_adapters::in_memory::{
 use raven_core::{
     DynamicClusteringAlg, GraphOracle,
     alg::DynamicClustering,
-    types::{AlgType, PartitionOutput, PartitionType, Strict, TrialOutputMode},
+    types::{AlgType, NodeIdentity, PartitionOutput, PartitionType, Strict, TrialOutputMode},
 };
 
 #[cfg(feature = "bench-clustering")]
@@ -63,6 +63,32 @@ fn replay_graph(workload: &SbmDiffWorkload<f64>) -> InMemoryUndirectedGraph<usiz
         batch
             .apply_to_graph(&mut graph)
             .expect("generated workload should replay into graph");
+        let _ = graph.flush_node_ops();
+    }
+    graph
+}
+
+fn replay_dense_graph(
+    workload: &SbmDiffWorkload<f64>,
+) -> InMemoryUndirectedGraph<NodeIdentity, f64> {
+    let mut graph = InMemoryUndirectedGraph::new();
+    for batch in &workload.batches {
+        for op in &batch.edge_ops {
+            match *op {
+                raven_adapters::in_memory::workloads::SbmEdgeOp::Set { u, v, weight } => graph
+                    .update_edge(NodeIdentity(u), NodeIdentity(v), Some(weight))
+                    .expect("generated workload should replay into dense graph"),
+                raven_adapters::in_memory::workloads::SbmEdgeOp::Delete { u, v } => {
+                    match graph.update_edge(NodeIdentity(u), NodeIdentity(v), None) {
+                        Ok(())
+                        | Err(raven_adapters::in_memory::InMemoryGraphError::MissingEdge) => {}
+                        Err(err) => {
+                            panic!("generated workload failed to replay into dense graph: {err}")
+                        }
+                    }
+                }
+            }
+        }
         let _ = graph.flush_node_ops();
     }
     graph
@@ -175,6 +201,7 @@ fn run_subset_query(
 fn bench_oracle_batch_lookup(c: &mut Criterion) {
     let workload = workload();
     let graph = replay_graph(&workload);
+    let dense_graph = replay_dense_graph(&workload);
     let live_nodes = live_nodes(&workload, &graph);
     assert!(
         live_nodes.len() >= CORESET_SIZE,
@@ -189,9 +216,19 @@ fn bench_oracle_batch_lookup(c: &mut Criterion) {
         .copied()
         .take(CORESET_SIZE)
         .collect::<Vec<_>>();
+    let dense_graph_batch = graph_batch
+        .iter()
+        .copied()
+        .map(NodeIdentity)
+        .collect::<Vec<_>>();
+    let dense_coreset_batch = coreset_batch
+        .iter()
+        .copied()
+        .map(NodeIdentity)
+        .collect::<Vec<_>>();
 
     let mut group = c.benchmark_group("in_memory/oracle");
-    group.bench_function("graph_neighbourhoods", |b| {
+    group.bench_function("generic_graph_neighbourhoods", |b| {
         let mut oracle = graph.oracle();
         b.iter(|| {
             let neighbourhoods = oracle
@@ -201,12 +238,58 @@ fn bench_oracle_batch_lookup(c: &mut Criterion) {
             black_box(neighbourhoods.offsets().len());
         });
     });
-    group.bench_function("coreset_neighbourhoods", |b| {
+    group.bench_function("generic_graph_neighbourhoods_intersecting", |b| {
+        let mut oracle = graph.oracle();
+        b.iter(|| {
+            let neighbourhoods = oracle
+                .graph_neighbourhoods_intersecting(
+                    black_box(graph_batch.as_slice()),
+                    black_box(coreset_batch.as_slice()),
+                )
+                .expect("intersecting neighbourhood batch should succeed");
+            black_box(neighbourhoods.data().len());
+            black_box(neighbourhoods.offsets().len());
+        });
+    });
+    group.bench_function("generic_coreset_neighbourhoods", |b| {
         let mut oracle = graph.oracle();
         b.iter(|| {
             let neighbourhoods = oracle
                 .coreset_neighbourhoods(black_box(coreset_batch.as_slice()))
                 .expect("coreset neighbourhood batch should succeed");
+            black_box(neighbourhoods.data().len());
+            black_box(neighbourhoods.offsets().len());
+        });
+    });
+    group.bench_function("dense_graph_neighbourhoods", |b| {
+        let mut oracle = dense_graph.dense_oracle();
+        b.iter(|| {
+            let neighbourhoods = oracle
+                .graph_neighbourhoods(black_box(dense_graph_batch.as_slice()))
+                .expect("dense graph neighbourhood batch should succeed");
+            black_box(neighbourhoods.data().len());
+            black_box(neighbourhoods.offsets().len());
+        });
+    });
+    group.bench_function("dense_graph_neighbourhoods_intersecting", |b| {
+        let mut oracle = dense_graph.dense_oracle();
+        b.iter(|| {
+            let neighbourhoods = oracle
+                .graph_neighbourhoods_intersecting(
+                    black_box(dense_graph_batch.as_slice()),
+                    black_box(dense_coreset_batch.as_slice()),
+                )
+                .expect("dense intersecting neighbourhood batch should succeed");
+            black_box(neighbourhoods.data().len());
+            black_box(neighbourhoods.offsets().len());
+        });
+    });
+    group.bench_function("dense_coreset_neighbourhoods", |b| {
+        let mut oracle = dense_graph.dense_oracle();
+        b.iter(|| {
+            let neighbourhoods = oracle
+                .coreset_neighbourhoods(black_box(dense_coreset_batch.as_slice()))
+                .expect("dense coreset neighbourhood batch should succeed");
             black_box(neighbourhoods.data().len());
             black_box(neighbourhoods.offsets().len());
         });

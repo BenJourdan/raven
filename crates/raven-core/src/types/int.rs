@@ -7,6 +7,24 @@ use std::{
 #[derive(Eq, PartialEq, Hash, Copy, Clone, Debug, Ord, PartialOrd)]
 pub struct NodeIdentity(pub usize);
 
+impl NodeIdentity {
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+
+impl From<usize> for NodeIdentity {
+    fn from(index: usize) -> Self {
+        Self(index)
+    }
+}
+
+impl From<NodeIdentity> for usize {
+    fn from(identity: NodeIdentity) -> Self {
+        identity.0
+    }
+}
+
 impl fmt::Display for NodeIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)

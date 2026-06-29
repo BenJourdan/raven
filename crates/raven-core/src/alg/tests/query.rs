@@ -5,9 +5,14 @@ use rand::RngExt;
 use super::common::*;
 use crate::{
     DynamicClusteringAlg, GraphOracle,
-    alg::{QueryTime, ResizeQueryInfo, RngMode, TrialWorkspace, coreset_impls::Coreset},
+    alg::{
+        QueryTime, ResizeQueryInfo, RngMode, SamplingInfo, TrialWorkspace, coreset_impls::Coreset,
+    },
     error::{DynamicCoresetError, OracleError},
-    types::{Neighbourhoods, PartitionOutput, PartitionType, TrialObjective, TrialOutputMode},
+    types::{
+        Neighbourhoods, PartitionOutput, PartitionType, StrictCarrierOps, TreeIndex,
+        TrialObjective, TrialOutputMode,
+    },
 };
 
 struct IntersectOnlyEmptyOracle {
@@ -55,6 +60,103 @@ impl GraphOracle<usize, f64, String> for IntersectOnlyEmptyOracle {
     ) -> Result<Neighbourhoods<'a, usize, f64>, OracleError<String>> {
         self.empty_rows(nodes)
     }
+}
+
+#[test]
+fn query_time_resizes_dense_sampling_scratch() {
+    let mut query_time = QueryTime::<f64>::default();
+
+    query_time.resize(5);
+    assert_eq!(query_time.timestamp.len(), 5);
+    assert_eq!(query_time.f_delta.len(), 5);
+    assert_eq!(query_time.h_b.len(), 5);
+    assert_eq!(query_time.h_s.len(), 5);
+    assert_eq!(query_time.seed_owner.len(), 5);
+    assert_eq!(query_time.seed_owner_epoch.len(), 5);
+    assert_eq!(query_time.seed_weight.len(), 5);
+    assert_eq!(query_time.seed_weight_epoch.len(), 5);
+    assert_eq!(query_time.old_seed_seen.len(), 5);
+    assert_eq!(query_time.tree_update_seen.len(), 5);
+
+    query_time.truncate(3);
+    assert_eq!(query_time.timestamp.len(), 3);
+    assert_eq!(query_time.f_delta.len(), 3);
+    assert_eq!(query_time.h_b.len(), 3);
+    assert_eq!(query_time.h_s.len(), 3);
+    assert_eq!(query_time.seed_owner.len(), 3);
+    assert_eq!(query_time.seed_owner_epoch.len(), 3);
+    assert_eq!(query_time.seed_weight.len(), 3);
+    assert_eq!(query_time.seed_weight_epoch.len(), 3);
+    assert_eq!(query_time.old_seed_seen.len(), 3);
+    assert_eq!(query_time.tree_update_seen.len(), 3);
+
+    query_time.clear();
+    assert!(query_time.timestamp.is_empty());
+    assert!(query_time.f_delta.is_empty());
+    assert!(query_time.h_b.is_empty());
+    assert!(query_time.h_s.is_empty());
+    assert!(query_time.seed_owner.is_empty());
+    assert!(query_time.seed_owner_epoch.is_empty());
+    assert!(query_time.seed_weight.is_empty());
+    assert!(query_time.seed_weight_epoch.is_empty());
+    assert!(query_time.old_seed_seen.is_empty());
+    assert!(query_time.tree_update_seen.is_empty());
+}
+
+#[test]
+fn dense_sampling_state_defaults_sets_and_updates_seed_weights() {
+    let clustering = query_ready_clustering(ResizeQueryInfo::Updates, 1);
+    let tree_len = clustering.tree_data.persistent.size.len();
+    let mut query_time = QueryTime::<f64>::default();
+    query_time.resize(tree_len);
+
+    let x_star_idx = TreeIndex(1);
+    let node_idx = TreeIndex(2);
+    let seed_idx = TreeIndex(3);
+    let timestamp = 7;
+    let mut workspace = TrialWorkspace::<2, _, _> {
+        timestamp,
+        persistent: &clustering.tree_data.persistent,
+        query_time: &mut query_time,
+        tree_to_node_map: &clustering.tree_to_node_map,
+        node_to_tree_map: &clustering.node_to_tree_map,
+    };
+    let mut info = SamplingInfo::new(
+        x_star_idx,
+        strict(1.0),
+        strict(1.0),
+        timestamp,
+        strict(10.0),
+    );
+    workspace.initialize_sampling_state(&mut info, strict(10.0));
+
+    assert_eq!(workspace.get_seed_idx(node_idx, &info), x_star_idx);
+    workspace.set_seed_idx(node_idx, seed_idx, &info);
+    assert_eq!(workspace.get_seed_idx(node_idx, &info), seed_idx);
+
+    assert_eq!(
+        workspace.get_seed_weight(x_star_idx, &info).into_scalar(),
+        10.0
+    );
+    workspace
+        .modify_seed_weight(seed_idx, 4.0, &mut info)
+        .unwrap();
+    workspace
+        .modify_seed_weight(seed_idx, 1.5, &mut info)
+        .unwrap();
+    assert_eq!(
+        workspace.get_seed_weight(seed_idx, &info).into_scalar(),
+        5.5
+    );
+
+    workspace
+        .modify_seed_weight(x_star_idx, -2.0, &mut info)
+        .unwrap();
+    assert_eq!(
+        workspace.get_seed_weight(x_star_idx, &info).into_scalar(),
+        8.0
+    );
+    assert_eq!(info.x_star_seed_set_volume_inv.into_scalar(), 0.125);
 }
 
 #[test]
@@ -195,6 +297,8 @@ fn full_graph_labelling_does_not_invent_projection_self_loops() {
         node_indices: vec![node_one_idx, node_two_idx],
         weights: vec![strict(1.0), strict(1.0)],
         coreset_labels: Some(vec![0, 1]),
+        coreset_neighbourhood_data: Vec::new(),
+        coreset_neighbourhood_offsets: Vec::new(),
     };
     let mut oracle = EmptyOracle::new();
 
@@ -229,6 +333,8 @@ fn full_graph_labelling_uses_intersecting_oracle_lookup() {
         node_indices: vec![node_one_idx, node_two_idx],
         weights: vec![strict(1.0), strict(1.0)],
         coreset_labels: Some(vec![0, 1]),
+        coreset_neighbourhood_data: Vec::new(),
+        coreset_neighbourhood_offsets: Vec::new(),
     };
     let mut oracle = IntersectOnlyEmptyOracle::new();
 
@@ -311,12 +417,24 @@ fn query_succeeds_with_update_and_query_time_resize_modes() {
                     assert_eq!(query_time.f_delta.len(), tree_len);
                     assert_eq!(query_time.h_b.len(), tree_len);
                     assert_eq!(query_time.h_s.len(), tree_len);
+                    assert_eq!(query_time.seed_owner.len(), tree_len);
+                    assert_eq!(query_time.seed_owner_epoch.len(), tree_len);
+                    assert_eq!(query_time.seed_weight.len(), tree_len);
+                    assert_eq!(query_time.seed_weight_epoch.len(), tree_len);
+                    assert_eq!(query_time.old_seed_seen.len(), tree_len);
+                    assert_eq!(query_time.tree_update_seen.len(), tree_len);
                 }
                 ResizeQueryInfo::Query => {
                     assert!(query_time.timestamp.is_empty());
                     assert!(query_time.f_delta.is_empty());
                     assert!(query_time.h_b.is_empty());
                     assert!(query_time.h_s.is_empty());
+                    assert!(query_time.seed_owner.is_empty());
+                    assert!(query_time.seed_owner_epoch.is_empty());
+                    assert!(query_time.seed_weight.is_empty());
+                    assert!(query_time.seed_weight_epoch.is_empty());
+                    assert!(query_time.old_seed_seen.is_empty());
+                    assert!(query_time.tree_update_seen.is_empty());
                 }
             }
         }
@@ -344,6 +462,12 @@ fn query_succeeds_with_update_and_query_time_resize_modes() {
             assert_eq!(query_time.f_delta.len(), tree_len);
             assert_eq!(query_time.h_b.len(), tree_len);
             assert_eq!(query_time.h_s.len(), tree_len);
+            assert_eq!(query_time.seed_owner.len(), tree_len);
+            assert_eq!(query_time.seed_owner_epoch.len(), tree_len);
+            assert_eq!(query_time.seed_weight.len(), tree_len);
+            assert_eq!(query_time.seed_weight_epoch.len(), tree_len);
+            assert_eq!(query_time.old_seed_seen.len(), tree_len);
+            assert_eq!(query_time.tree_update_seen.len(), tree_len);
         }
     }
 }

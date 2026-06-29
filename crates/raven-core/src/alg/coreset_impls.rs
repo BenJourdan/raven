@@ -1,4 +1,6 @@
 use std::num::NonZero;
+#[cfg(feature = "deep-query-timing")]
+use std::time::Instant;
 
 use anyhow::{Result, anyhow};
 use faer::sparse::{SparseRowMat, SymbolicSparseRowMat};
@@ -6,7 +8,9 @@ use rand::RngExt;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::{SamplingInfo, TreeLayout, TrialWorkspace};
+use super::{
+    CoresetExtractionTiming, FullGraphLabelTiming, SamplingInfo, TreeLayout, TrialWorkspace,
+};
 use crate::{
     GraphOracle,
     error::DynamicCoresetError,
@@ -16,18 +20,77 @@ use crate::{
     },
 };
 
+#[cfg(feature = "deep-query-timing")]
+macro_rules! timing_start {
+    () => {
+        Instant::now()
+    };
+}
+
+#[cfg(not(feature = "deep-query-timing"))]
+macro_rules! timing_start {
+    () => {
+        ()
+    };
+}
+
+#[cfg(feature = "deep-query-timing")]
+macro_rules! timing_add_elapsed {
+    ($target:expr, $started:expr) => {
+        $target += $started.elapsed();
+    };
+}
+
+#[cfg(not(feature = "deep-query-timing"))]
+macro_rules! timing_add_elapsed {
+    ($target:expr, $started:expr) => {{
+        let _ = &$target;
+        let _ = &$started;
+    }};
+}
+
+#[cfg(feature = "deep-query-timing")]
+macro_rules! timing_add {
+    ($target:expr, $value:expr) => {
+        $target += $value;
+    };
+}
+
+#[cfg(not(feature = "deep-query-timing"))]
+macro_rules! timing_add {
+    ($target:expr, $value:expr) => {{
+        let _ = || {
+            let _ = &$target;
+            let _ = &$value;
+        };
+    }};
+}
+
 pub struct Coreset<V, T> {
     pub nodes: Vec<V>,
     pub node_indices: Vec<TreeIndex>,
     pub weights: Vec<Strict<T>>,
     pub coreset_labels: Option<Vec<usize>>,
+    pub coreset_neighbourhood_data: Vec<(V, Strict<T>)>,
+    pub coreset_neighbourhood_offsets: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CoresetProjectionInfo<T> {
-    label: usize,
-    weight: T,
-    degree: T,
+impl<V, T> Coreset<V, T> {
+    fn cached_coreset_neighbourhood_rows(&self) -> Option<Vec<&[(V, Strict<T>)]>> {
+        if self.coreset_neighbourhood_offsets.len() != self.nodes.len() + 1 {
+            return None;
+        }
+
+        let rows = (0..self.nodes.len())
+            .map(|idx| {
+                let start = self.coreset_neighbourhood_offsets[idx];
+                let end = self.coreset_neighbourhood_offsets[idx + 1];
+                self.coreset_neighbourhood_data.get(start..end)
+            })
+            .collect::<Option<Vec<_>>>()?;
+
+        Some(rows)
+    }
 }
 
 fn lookup_graph_neighbourhoods<'a, V, T, G, E>(
@@ -41,20 +104,6 @@ where
 {
     oracle
         .graph_neighbourhoods(nodes)
-        .map_err(|e| anyhow!("{context}: {e}"))
-}
-
-fn lookup_coreset_neighbourhoods<'a, V, T, G, E>(
-    oracle: &'a mut G,
-    nodes: &[V],
-    context: &str,
-) -> Result<Neighbourhoods<'a, V, T>>
-where
-    G: GraphOracle<V, T, E> + ?Sized,
-    E: std::fmt::Display,
-{
-    oracle
-        .coreset_neighbourhoods(nodes)
         .map_err(|e| anyhow!("{context}: {e}"))
 }
 
@@ -90,32 +139,21 @@ where
 
 // SamplingInfo impl
 
-impl<V, T> SamplingInfo<V, T>
+impl<T> SamplingInfo<T>
 where
-    V: std::hash::Hash + Eq + Clone + Copy,
     T: FloatScalar, // T must be a floating point type (either f32 or f64)
     Strict<T>: StrictCarrierOps<Scalar = T> + Copy,
     NonStrict<T>: NonStrictCarrierOps<Scalar = T> + Copy,
 {
     pub fn new(
-        x_star: V,
+        x_star_idx: TreeIndex,
         sigma: Strict<T>,
         sigma_over_x_star_deg: Strict<T>,
         timestamp: usize,
         total_weight: Strict<T>,
     ) -> Self {
-        // weights are always positive, ASSUMING a definite kernel
-        // because seed sets will always contain at least the seed.
-        let mut seed_weight = FxHashMap::<V, Strict<T>>::default();
-        // Initially, the only seed is x^*, with seed weight equal to the total weight (volume) of the input
-        seed_weight.insert(x_star, total_weight);
-
-        let mut seed_map = FxHashMap::<V, V>::default();
-        // Initially, we just have x^* maps to itself:
-        seed_map.insert(x_star, x_star);
-
         Self {
-            x_star,
+            x_star_idx,
             sigma,
             sigma_over_x_star_deg,
             timestamp,
@@ -124,44 +162,7 @@ where
             )
             .expect("total weight must have a positive finite reciprocal"),
             total_contribution_inv: None,
-            seed_weight,
-            seed_map,
         }
-    }
-
-    pub fn get_seed(&mut self, node: V) -> V {
-        // return the seed of a point, defaulting to x_star if not seen before
-        *self.seed_map.entry(node).or_insert(self.x_star)
-    }
-
-    pub fn set_seed(&mut self, node: V, seed: V) {
-        // Overwrite any existing seed entry (get_seed initializes to x_star on first access).
-        self.seed_map.insert(node, seed);
-    }
-
-    pub fn modify_seed_weight(&mut self, seed: V, diff: T) -> Result<()> {
-        // increment the seed weight of seed by diff. If it is not present, insert it with this value
-        let new_weight_scalar = match self.seed_weight.get(&seed) {
-            Some(weight) => weight.into_scalar() + diff,
-            None => diff,
-        };
-
-        let new_weight = Strict::<T>::from_positive_scalar(new_weight_scalar)
-            .map_err(|e| anyhow!("seed weight update produced invalid weight: {e}"))?;
-        self.seed_weight.insert(seed, new_weight);
-
-        // keep x_star seed set volume in sync for g() smoothing term
-        if seed == self.x_star {
-            self.x_star_seed_set_volume_inv =
-                Strict::<T>::from_positive_scalar(T::ONE / new_weight.into_scalar())
-                    .map_err(|e| anyhow!("x_star seed weight reciprocal is invalid: {e}"))?;
-        }
-
-        Ok(())
-    }
-
-    pub fn get_seed_weight(&self, seed: V) -> Strict<T> {
-        *self.seed_weight.get(&seed).unwrap()
     }
 }
 
@@ -172,19 +173,109 @@ where
     Strict<T>: StrictCarrierOps<Scalar = T> + Copy,
     NonStrict<T>: NonStrictCarrierOps<Scalar = T> + Copy,
 {
+    pub(crate) fn initialize_sampling_state(
+        &mut self,
+        info: &mut SamplingInfo<T>,
+        total_weight: Strict<T>,
+    ) {
+        self.set_seed_idx(info.x_star_idx, info.x_star_idx, info);
+        self.query_time.seed_weight[info.x_star_idx] = total_weight.into_scalar();
+        self.query_time.seed_weight_epoch[info.x_star_idx] = info.timestamp;
+    }
+
+    pub(crate) fn get_seed_idx(&self, node_idx: TreeIndex, info: &SamplingInfo<T>) -> TreeIndex {
+        if self.query_time.seed_owner_epoch[node_idx] == info.timestamp {
+            self.query_time.seed_owner[node_idx]
+        } else {
+            info.x_star_idx
+        }
+    }
+
+    pub(crate) fn set_seed_idx(
+        &mut self,
+        node_idx: TreeIndex,
+        seed_idx: TreeIndex,
+        info: &SamplingInfo<T>,
+    ) {
+        self.query_time.seed_owner[node_idx] = seed_idx;
+        self.query_time.seed_owner_epoch[node_idx] = info.timestamp;
+    }
+
+    pub(crate) fn get_seed_weight(&self, seed_idx: TreeIndex, info: &SamplingInfo<T>) -> Strict<T> {
+        debug_assert_eq!(
+            self.query_time.seed_weight_epoch[seed_idx], info.timestamp,
+            "seed weight should have been initialized before lookup"
+        );
+        Strict::<T>::from_positive_scalar(self.query_time.seed_weight[seed_idx])
+            .expect("seed weight should be positive and finite")
+    }
+
+    pub(crate) fn modify_seed_weight(
+        &mut self,
+        seed_idx: TreeIndex,
+        diff: T,
+        info: &mut SamplingInfo<T>,
+    ) -> Result<()> {
+        let current = if self.query_time.seed_weight_epoch[seed_idx] == info.timestamp {
+            self.query_time.seed_weight[seed_idx]
+        } else {
+            T::ZERO
+        };
+        let new_weight = Strict::<T>::from_positive_scalar(current + diff)
+            .map_err(|e| anyhow!("seed weight update produced invalid weight: {e}"))?;
+
+        self.query_time.seed_weight[seed_idx] = new_weight.into_scalar();
+        self.query_time.seed_weight_epoch[seed_idx] = info.timestamp;
+
+        if seed_idx == info.x_star_idx {
+            info.x_star_seed_set_volume_inv =
+                Strict::<T>::from_positive_scalar(T::ONE / new_weight.into_scalar())
+                    .map_err(|e| anyhow!("x_star seed weight reciprocal is invalid: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    fn next_old_seed_seen_epoch(&mut self) -> usize {
+        self.query_time.old_seed_seen_epoch = self
+            .query_time
+            .old_seed_seen_epoch
+            .checked_add(1)
+            .unwrap_or_else(|| {
+                self.query_time.old_seed_seen.fill(0);
+                1
+            });
+        self.query_time.old_seed_seen_epoch
+    }
+
+    fn push_old_seed_once(
+        &mut self,
+        old_seed_idx: TreeIndex,
+        seen_epoch: usize,
+        old_seeds: &mut Vec<TreeIndex>,
+    ) {
+        if self.query_time.old_seed_seen[old_seed_idx] == seen_epoch {
+            return;
+        }
+        self.query_time.old_seed_seen[old_seed_idx] = seen_epoch;
+        old_seeds.push(old_seed_idx);
+    }
+
     fn move_seed_membership(
-        info: &mut SamplingInfo<V, T>,
-        node: V,
-        new_seed: V,
+        &mut self,
+        info: &mut SamplingInfo<T>,
+        node_idx: TreeIndex,
+        new_seed_idx: TreeIndex,
         weight: T,
-        old_seeds: &mut FxHashSet<V>,
+        old_seeds: &mut Vec<TreeIndex>,
+        old_seed_seen_epoch: usize,
         allow_already_in_seed: bool,
         context: &str,
     ) -> Result<()> {
-        let old_seed = info.get_seed(node);
-        if old_seed == new_seed {
+        let old_seed_idx = self.get_seed_idx(node_idx, info);
+        if old_seed_idx == new_seed_idx {
             if allow_already_in_seed {
-                info.set_seed(node, new_seed);
+                self.set_seed_idx(node_idx, new_seed_idx, info);
                 return Ok(());
             }
 
@@ -193,10 +284,10 @@ where
             ));
         }
 
-        old_seeds.insert(old_seed);
-        info.modify_seed_weight(old_seed, -weight)?;
-        info.modify_seed_weight(new_seed, weight)?;
-        info.set_seed(node, new_seed);
+        self.push_old_seed_once(old_seed_idx, old_seed_seen_epoch, old_seeds);
+        self.modify_seed_weight(old_seed_idx, -weight, info)?;
+        self.modify_seed_weight(new_seed_idx, weight, info)?;
+        self.set_seed_idx(node_idx, new_seed_idx, info);
 
         Ok(())
     }
@@ -216,47 +307,108 @@ where
         });
     }
 
-    fn recompute_h_to_root(&mut self, source: TreeIndex) {
-        let timestamp = self.timestamp;
-        let persistent = self.persistent;
-        let query_time = &mut *self.query_time;
-        TreeLayout::<ARITY>::apply_updates_from_single(source, |idx| {
-            TreeLayout::<ARITY>::one_step_recompute_non_strict_with_timestamp(
-                idx,
-                &mut query_time.h_b,
-                &query_time.timestamp,
-                timestamp,
-                |i| {
-                    // HB::from_scalar(persistent.volume[i].into_scalar())
-                    //     .expect("volume must be non-negative")
-                    unsafe { HB::from_scalar_unchecked(persistent.volume[i].into_scalar()) }
-                },
-            );
-            TreeLayout::<ARITY>::one_step_recompute_non_strict_with_timestamp(
-                idx,
-                &mut query_time.h_s,
-                &query_time.timestamp,
-                timestamp,
-                |_i| HS::zero(),
-            );
-            query_time.timestamp[idx] = timestamp;
-        });
-    }
-
-    fn recompute_h_s_from_set(&mut self, update_set: &FxHashSet<TreeIndex>) {
+    fn recompute_f_delta_from_updates(&mut self, update_indices: &[TreeIndex]) {
         let timestamp = self.timestamp;
         let total = self.persistent.size.len();
         let query_time = &mut *self.query_time;
-        TreeLayout::<ARITY>::apply_updates_from_set(total, update_set, |idx| {
-            TreeLayout::<ARITY>::one_step_recompute_non_strict_with_timestamp(
-                idx,
-                &mut query_time.h_s,
-                &query_time.timestamp,
-                timestamp,
-                |_i| HS::zero(),
-            );
-            query_time.timestamp[idx] = timestamp;
-        });
+        let mut current = std::mem::take(&mut query_time.tree_update_current);
+        let mut next = std::mem::take(&mut query_time.tree_update_next);
+        let mut seen = std::mem::take(&mut query_time.tree_update_seen);
+        let mut seen_epoch = query_time.tree_update_seen_epoch;
+
+        TreeLayout::<ARITY>::apply_updates_from_slice_with_marker(
+            total,
+            update_indices,
+            &mut current,
+            &mut next,
+            &mut seen,
+            &mut seen_epoch,
+            |idx| {
+                TreeLayout::<ARITY>::one_step_recompute_non_strict_with_timestamp(
+                    idx,
+                    &mut query_time.f_delta,
+                    &query_time.timestamp,
+                    timestamp,
+                    |_i| FDelta::zero(),
+                );
+                query_time.timestamp[idx] = timestamp;
+            },
+        );
+
+        query_time.tree_update_current = current;
+        query_time.tree_update_next = next;
+        query_time.tree_update_seen = seen;
+        query_time.tree_update_seen_epoch = seen_epoch;
+    }
+
+    fn recompute_h_from_updates(&mut self, update_indices: &[TreeIndex]) {
+        let timestamp = self.timestamp;
+        let total = self.persistent.size.len();
+        let persistent = self.persistent;
+        let query_time = &mut *self.query_time;
+        let mut current = std::mem::take(&mut query_time.tree_update_current);
+        let mut next = std::mem::take(&mut query_time.tree_update_next);
+        let mut seen = std::mem::take(&mut query_time.tree_update_seen);
+        let mut seen_epoch = query_time.tree_update_seen_epoch;
+
+        TreeLayout::<ARITY>::apply_updates_from_slice_with_marker(
+            total,
+            update_indices,
+            &mut current,
+            &mut next,
+            &mut seen,
+            &mut seen_epoch,
+            |idx| {
+                TreeLayout::<ARITY>::one_step_recompute_h_pair_with_timestamp(
+                    idx,
+                    &mut query_time.h_b,
+                    &mut query_time.h_s,
+                    &persistent.volume,
+                    &query_time.timestamp,
+                    timestamp,
+                );
+                query_time.timestamp[idx] = timestamp;
+            },
+        );
+
+        query_time.tree_update_current = current;
+        query_time.tree_update_next = next;
+        query_time.tree_update_seen = seen;
+        query_time.tree_update_seen_epoch = seen_epoch;
+    }
+
+    fn recompute_h_s_from_updates(&mut self, update_indices: &[TreeIndex]) {
+        let timestamp = self.timestamp;
+        let total = self.persistent.size.len();
+        let query_time = &mut *self.query_time;
+        let mut current = std::mem::take(&mut query_time.tree_update_current);
+        let mut next = std::mem::take(&mut query_time.tree_update_next);
+        let mut seen = std::mem::take(&mut query_time.tree_update_seen);
+        let mut seen_epoch = query_time.tree_update_seen_epoch;
+
+        TreeLayout::<ARITY>::apply_updates_from_slice_with_marker(
+            total,
+            update_indices,
+            &mut current,
+            &mut next,
+            &mut seen,
+            &mut seen_epoch,
+            |idx| {
+                TreeLayout::<ARITY>::one_step_recompute_non_strict_with_timestamp(
+                    idx,
+                    &mut query_time.h_s,
+                    &query_time.timestamp,
+                    timestamp,
+                    |_i| HS::zero(),
+                );
+                query_time.timestamp[idx] = timestamp;
+            },
+        );
+
+        query_time.tree_update_current = current;
+        query_time.tree_update_next = next;
+        query_time.tree_update_seen = seen;
+        query_time.tree_update_seen_epoch = seen_epoch;
     }
 
     pub fn extract_coreset_trial<G, E>(
@@ -273,6 +425,35 @@ where
         G: GraphOracle<V, T, E> + ?Sized + Send,
         E: std::fmt::Display,
     {
+        let mut timing = CoresetExtractionTiming::default();
+        self.extract_coreset_trial_timed(
+            graph_oracle,
+            sigma,
+            x_star,
+            x_star_degree,
+            coreset_size,
+            sampling_seeds,
+            rng,
+            &mut timing,
+        )
+    }
+
+    pub(crate) fn extract_coreset_trial_timed<G, E>(
+        &mut self,
+        graph_oracle: &mut G,
+        sigma: Strict<T>,
+        x_star: V,
+        x_star_degree: NodeDegree<T>,
+        coreset_size: NonZero<usize>,
+        sampling_seeds: NonZero<usize>,
+        rng: &mut impl rand::Rng,
+        timing: &mut CoresetExtractionTiming,
+    ) -> Result<Coreset<V, T>>
+    where
+        G: GraphOracle<V, T, E> + ?Sized + Send,
+        E: std::fmt::Display,
+    {
+        let setup_started = timing_start!();
         // basic sanity: can't sample more seeds than leaves or build a coreset smaller than the seed set
         let root_size = self
             .persistent
@@ -305,20 +486,28 @@ where
         let sigma_over_x_star_deg =
             Strict::<T>::from_positive_scalar(sigma.into_scalar() / x_star_degree.into_scalar())
                 .map_err(|e| anyhow!("sigma/x_star_degree was invalid: {e}"))?;
+        let x_star_idx = *self
+            .node_to_tree_map
+            .get(&x_star)
+            .ok_or_else(|| anyhow!("x_star was missing from the tree"))?;
 
         let mut info = SamplingInfo::new(
-            x_star,
+            x_star_idx,
             sigma,
             sigma_over_x_star_deg,
             timestamp,
             self.persistent.volume[0].0,
         );
+        self.initialize_sampling_state(&mut info, self.persistent.volume[0].0);
+        timing_add_elapsed!(timing.setup, setup_started);
 
         // sanity: leaves marked deleted should carry zero volume
         // self.assert_zero_volume_for_empty_leaves(&info);
 
         // first we add x_star:
-        self.repair(x_star, &mut info, graph_oracle)?;
+        let initial_repairs_started = timing_start!();
+        self.repair_timed(x_star, &mut info, graph_oracle, timing)?;
+        timing_add!(timing.initial_repair_calls, 1);
 
         // Now we sample a node uniformly:
         let tree_size = self.persistent.size.len();
@@ -326,18 +515,28 @@ where
 
         let uniform_idx = TreeIndex(rng.random_range(tree_size - num_leaves..tree_size));
         let uniform_node = *self.tree_to_node_map.get(&uniform_idx).unwrap();
-        self.repair(uniform_node, &mut info, graph_oracle)?;
+        self.repair_timed(uniform_node, &mut info, graph_oracle, timing)?;
+        timing_add!(timing.initial_repair_calls, 1);
+        timing_add_elapsed!(timing.initial_repairs, initial_repairs_started);
 
         let remaining_seeds = sampling_seeds.get().saturating_sub(2);
         for i in 0..remaining_seeds {
             // Sample a point according to f:
+            let seed_sample_started = timing_start!();
             let (node, _, _) = self.sample(&info, rng).map_err(|e| {
                 anyhow!("failed sampling seed {} of {}: {e}", i + 1, remaining_seeds)
             })?;
-            self.repair(node, &mut info, graph_oracle)?;
+            timing_add_elapsed!(timing.seed_sampling, seed_sample_started);
+            timing_add!(timing.seed_samples, 1);
+
+            let seed_repair_started = timing_start!();
+            self.repair_timed(node, &mut info, graph_oracle, timing)?;
+            timing_add_elapsed!(timing.seed_repairs, seed_repair_started);
+            timing_add!(timing.seed_repair_calls, 1);
         }
 
         // populate total_contribution_inv
+        let total_contribution_started = timing_start!();
         let total_contribution = self.f(TreeIndex(0), &info);
         let total_contribution_scalar = total_contribution.into_scalar();
         debug_assert!(
@@ -349,19 +548,26 @@ where
                 anyhow!("total contribution reciprocal was not non-negative finite: {e}")
             })?,
         );
+        timing_add_elapsed!(timing.total_contribution, total_contribution_started);
 
         let coreset_size_f =
             T::from(coreset_size.get()).expect("coreset size should convert to scalar");
-        let coreset_iterator = (0..coreset_size.get()).map(|_| {
-            let (node, idx, prob) = self.sample_smoothed(&info, rng).unwrap();
-            let node_deg = self.persistent.volume[idx].into_scalar();
-            let weight = node_deg / (prob.into_scalar() * coreset_size_f);
-            (node, idx, weight)
-        });
+        let smoothed_sampling_started = timing_start!();
+        let coreset_samples = (0..coreset_size.get())
+            .map(|_| {
+                let (node, idx, prob) = self.sample_smoothed(&info, rng).unwrap();
+                let node_deg = self.persistent.volume[idx].into_scalar();
+                let weight = node_deg / (prob.into_scalar() * coreset_size_f);
+                (node, idx, weight)
+            })
+            .collect::<Vec<_>>();
+        timing_add_elapsed!(timing.smoothed_sampling, smoothed_sampling_started);
+        timing_add!(timing.smoothed_samples, coreset_samples.len());
 
         // Now we deduplicate the coreset:
+        let dedup_started = timing_start!();
         let mut coreset: FxHashMap<(V, TreeIndex), T> = FxHashMap::default();
-        for (v, index, weight) in coreset_iterator {
+        for (v, index, weight) in coreset_samples {
             let entry = coreset.entry((v, index)).or_insert(T::ZERO);
             *entry = *entry + weight;
         }
@@ -381,25 +587,45 @@ where
                     .map_err(|e| anyhow!("deduplicated coreset weight was invalid: {e}"))?,
             );
         }
+        timing_add!(timing.dedup_unique_nodes, unique_vs.len());
+        timing_add_elapsed!(timing.deduplication, dedup_started);
 
         Ok(Coreset {
             nodes: unique_vs,
             node_indices: unique_indices,
             weights,
             coreset_labels: None,
+            coreset_neighbourhood_data: Vec::new(),
+            coreset_neighbourhood_offsets: Vec::new(),
         })
     }
 
     pub fn repair<G, E>(
         &mut self,
         point_added: V,
-        info: &mut SamplingInfo<V, T>,
+        info: &mut SamplingInfo<T>,
         graph_oracle: &mut G,
     ) -> Result<()>
     where
         G: GraphOracle<V, T, E> + ?Sized,
         E: std::fmt::Display,
     {
+        let mut timing = CoresetExtractionTiming::default();
+        self.repair_timed(point_added, info, graph_oracle, &mut timing)
+    }
+
+    fn repair_timed<G, E>(
+        &mut self,
+        point_added: V,
+        info: &mut SamplingInfo<T>,
+        graph_oracle: &mut G,
+        timing: &mut CoresetExtractionTiming,
+    ) -> Result<()>
+    where
+        G: GraphOracle<V, T, E> + ?Sized,
+        E: std::fmt::Display,
+    {
+        timing_add!(timing.repair_calls, 1);
         // We implicitly add the point to the init set, update its neighbours,
         // and seed maps / seed weights.
         let point_added_index = *self.node_to_tree_map.get(&point_added).unwrap();
@@ -408,45 +634,61 @@ where
         let point_added_degree = NodeDegree::from_scalar(point_added_volume.into_scalar())
             .map_err(|e| anyhow!("point-added volume could not be used as a node degree: {e}"))?;
         let point_added_weight = point_added_volume.into_scalar();
-        let mut old_seeds = FxHashSet::default();
+        let mut old_seeds = Vec::new();
+        let old_seed_seen_epoch = self.next_old_seed_seen_epoch();
 
-        Self::move_seed_membership(
+        let point_seed_move_started = timing_start!();
+        self.move_seed_membership(
             info,
-            point_added,
-            point_added,
+            point_added_index,
+            point_added_index,
             point_added_weight,
             &mut old_seeds,
+            old_seed_seen_epoch,
             true,
             "repair point seed move",
         )?;
+        timing_add_elapsed!(timing.repair_point_seed_move, point_seed_move_started);
 
         // Zero this point's f contribution by matching f_delta to f_b.
+        let point_f_delta_started = timing_start!();
         let f_b = self.f_b(point_added_index, info);
         self.query_time.f_delta[point_added_index] = FDelta::from_scalar(f_b.into_scalar())
             .map_err(|e| anyhow!("base contribution could not be stored as f_delta: {e}"))?;
         self.query_time.timestamp[point_added_index] = info.timestamp;
         self.recompute_f_delta_to_root(point_added_index);
+        timing_add_elapsed!(timing.repair_point_f_delta, point_f_delta_started);
 
         let point_query = [point_added];
+        let point_lookup_started = timing_start!();
         let neighbours =
             lookup_single_graph_neighbourhood(graph_oracle, &point_query, "repair point lookup")?;
+        timing_add_elapsed!(timing.repair_point_lookup, point_lookup_started);
 
-        let mut filtered_neighbours = Vec::with_capacity(neighbours.len());
+        let mut filtered_neighbour_indices = Vec::with_capacity(neighbours.len());
+        let mut f_delta_update_nodes = Vec::with_capacity(neighbours.len());
 
+        let neighbour_scan_started = timing_start!();
+        timing_add!(timing.repair_neighbours_scanned, neighbours.len());
         for (neighbour, edge_weight) in neighbours.iter() {
+            let neighbour_lookup_started = timing_start!();
             let neighbour_idx = *self.node_to_tree_map.get(neighbour).ok_or_else(|| {
                 anyhow!("repair point lookup returned a neighbour missing from the tree")
             })?;
-            let neighbour_volume = self.persistent.volume[neighbour_idx];
+            timing_add_elapsed!(timing.repair_neighbour_lookup, neighbour_lookup_started);
 
+            let neighbour_compare_started = timing_start!();
             let weighted_distance_to_point_added =
                 Self::weighted_kernel_distance(point_added_degree, EdgeWeight::new(*edge_weight));
             let current_contribution = self.f(neighbour_idx, info);
+            timing_add_elapsed!(timing.repair_neighbour_compare, neighbour_compare_started);
 
             if weighted_distance_to_point_added < current_contribution {
                 // Neighbour is now closer to this point.
-                filtered_neighbours.push(*neighbour);
+                filtered_neighbour_indices.push(neighbour_idx);
+                timing_add!(timing.repair_neighbours_improved, 1);
 
+                let f_delta_write_started = timing_start!();
                 let new_f_delta_term = (self.f_b(neighbour_idx, info).into_scalar()
                     - weighted_distance_to_point_added.into_scalar())
                 .max(T::ZERO);
@@ -455,33 +697,49 @@ where
                         anyhow!("updated f_delta term was not non-negative finite: {e}")
                     })?;
                 self.query_time.timestamp[neighbour_idx] = info.timestamp;
-                self.recompute_f_delta_to_root(neighbour_idx);
+                f_delta_update_nodes.push(neighbour_idx);
+                timing_add_elapsed!(timing.repair_neighbour_f_delta_write, f_delta_write_started);
 
-                Self::move_seed_membership(
+                let seed_move_started = timing_start!();
+                let neighbour_volume = self.persistent.volume[neighbour_idx];
+                self.move_seed_membership(
                     info,
-                    *neighbour,
-                    point_added,
+                    neighbour_idx,
+                    point_added_index,
                     neighbour_volume.into_scalar(),
                     &mut old_seeds,
+                    old_seed_seen_epoch,
                     // Nodes can already belong to this seed set. In
                     // particular, unseen nodes default to x_star, so repairing
                     // x_star should not try to debit and credit the same seed.
                     true,
                     "repair neighbour seed move",
                 )?;
+                timing_add_elapsed!(timing.repair_neighbour_seed_move, seed_move_started);
             }
         }
+        let f_delta_recompute_started = timing_start!();
+        self.recompute_f_delta_from_updates(&f_delta_update_nodes);
+        timing_add_elapsed!(
+            timing.repair_neighbour_f_delta_recompute,
+            f_delta_recompute_started
+        );
+        timing_add_elapsed!(timing.repair_neighbour_scan, neighbour_scan_started);
 
-        let seed_weight = info.get_seed_weight(point_added);
+        let seed_weight = self.get_seed_weight(point_added_index, info);
         let seed_weight_scalar = seed_weight.into_scalar();
         debug_assert!(
             seed_weight_scalar.is_finite() && seed_weight_scalar > T::ZERO,
             "seed weight must be non-zero for h_s update"
         );
 
-        for z in filtered_neighbours.into_iter().chain([point_added]) {
-            let z_idx = *self.node_to_tree_map.get(&z).unwrap();
-
+        let new_seed_h_update_started = timing_start!();
+        let new_seed_h_write_started = timing_start!();
+        let mut h_update_nodes = Vec::with_capacity(filtered_neighbour_indices.len() + 1);
+        for z_idx in filtered_neighbour_indices
+            .into_iter()
+            .chain([point_added_index])
+        {
             self.query_time.h_b[z_idx] = HB::zero();
             let deg_z = self.persistent.volume[z_idx].into_scalar();
             self.query_time.h_s[z_idx] =
@@ -490,65 +748,97 @@ where
                 })?;
 
             self.query_time.timestamp[z_idx] = info.timestamp;
-            self.recompute_h_to_root(z_idx);
+            h_update_nodes.push(z_idx);
         }
+        timing_add!(timing.repair_new_seed_h_update_nodes, h_update_nodes.len());
+        timing_add_elapsed!(timing.repair_new_seed_h_write, new_seed_h_write_started);
+
+        let new_seed_h_recompute_started = timing_start!();
+        self.recompute_h_from_updates(&h_update_nodes);
+        timing_add_elapsed!(
+            timing.repair_new_seed_h_recompute,
+            new_seed_h_recompute_started
+        );
+        timing_add_elapsed!(timing.repair_new_seed_h_update, new_seed_h_update_started);
 
         // Update h_s for nodes in old seed sets whose seed-set weights changed, except x^*.
-        let x_star = info.x_star;
         let timestamp = info.timestamp;
 
+        let old_seed_prepare_started = timing_start!();
         let old_seeds_and_weights = old_seeds
             .into_iter()
-            .filter(|s| *s != x_star)
-            .map(|s| (s, info.get_seed_weight(s)))
+            .filter(|s| *s != info.x_star_idx)
+            .map(|s| (s, self.get_seed_weight(s, info)))
             .collect::<Vec<_>>();
+        timing_add!(timing.repair_old_seed_count, old_seeds_and_weights.len());
 
         if old_seeds_and_weights.is_empty() {
+            timing_add_elapsed!(timing.repair_old_seed_prepare, old_seed_prepare_started);
             return Ok(());
         }
 
-        let mut h_s_update_set = FxHashSet::default();
+        let mut h_s_update_nodes = Vec::new();
         let old_seed_nodes = old_seeds_and_weights
             .iter()
-            .map(|(s, _)| *s)
-            .collect::<Vec<_>>();
+            .map(|(s, _)| {
+                self.tree_to_node_map
+                    .get(s)
+                    .copied()
+                    .ok_or_else(|| anyhow!("old seed was missing from the tree"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        timing_add_elapsed!(timing.repair_old_seed_prepare, old_seed_prepare_started);
+
+        let old_seed_lookup_started = timing_start!();
         let old_seed_neighbour_batches =
             lookup_graph_neighbourhoods(graph_oracle, &old_seed_nodes, "old seed lookup")?;
+        timing_add_elapsed!(timing.repair_old_seed_lookup, old_seed_lookup_started);
 
+        let old_seed_rescale_started = timing_start!();
         for ((s, seed_weight), neighbours) in old_seeds_and_weights
             .into_iter()
             .zip(old_seed_neighbour_batches.iter())
         {
+            timing_add!(timing.repair_old_seed_neighbours_scanned, neighbours.len());
             let seed_weight_scalar = seed_weight.into_scalar();
             debug_assert!(
                 seed_weight_scalar.is_finite() && seed_weight_scalar > T::ZERO,
                 "old seed weight must be non-zero for h_s rescale"
             );
 
-            for (z, _) in neighbours
-                .iter()
-                .filter(|(neighbour, _)| info.get_seed(*neighbour) == s)
-            {
+            for (z, _) in neighbours.iter() {
                 let z_idx = *self.node_to_tree_map.get(z).ok_or_else(|| {
                     anyhow!("old seed lookup returned a neighbour missing from the tree")
                 })?;
+                if self.get_seed_idx(z_idx, info) != s {
+                    continue;
+                }
+
+                timing_add!(timing.repair_old_seed_neighbours_rescaled, 1);
                 let deg_z = self.persistent.volume[z_idx].into_scalar();
                 self.query_time.h_s[z_idx] =
                     HS::from_scalar(deg_z / seed_weight_scalar).map_err(|e| {
                         anyhow!("h_s rescale for old seed set was not non-negative finite: {e}")
                     })?;
                 self.query_time.timestamp[z_idx] = timestamp;
-                h_s_update_set.insert(z_idx);
+                h_s_update_nodes.push(z_idx);
             }
         }
+        timing_add_elapsed!(timing.repair_old_seed_rescale, old_seed_rescale_started);
+        timing_add!(
+            timing.repair_old_seed_h_update_nodes,
+            h_s_update_nodes.len()
+        );
 
-        self.recompute_h_s_from_set(&h_s_update_set);
+        let h_s_recompute_started = timing_start!();
+        self.recompute_h_s_from_updates(&h_s_update_nodes);
+        timing_add_elapsed!(timing.repair_old_seed_h_recompute, h_s_recompute_started);
 
         Ok(())
     }
     pub fn build_coreset_graph<C, E>(
         &self,
-        coreset: &Coreset<V, T>,
+        coreset: &mut Coreset<V, T>,
         coreset_oracle: &mut C,
         sigma: Strict<T>,
     ) -> Result<SparseRowMat<usize, T>>
@@ -566,18 +856,67 @@ where
             ));
         }
 
-        let coreset_neighbourhoods = lookup_coreset_neighbourhoods(
-            coreset_oracle,
-            coreset.nodes.as_slice(),
-            "coreset graph lookup",
-        )?;
+        coreset.coreset_neighbourhood_data.clear();
+        coreset.coreset_neighbourhood_offsets.clear();
+        coreset.coreset_neighbourhood_offsets.reserve(n + 1);
+        coreset.coreset_neighbourhood_offsets.push(0);
 
-        let node_name_to_index = coreset
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(idx, name)| (*name, idx))
-            .collect::<FxHashMap<V, usize>>();
+        let mut coreset_neighbourhood_index_data = Vec::<(usize, Strict<T>)>::new();
+        let mut current_row = 0usize;
+        let mut visitor_error = None::<String>;
+        let visited_edges = coreset_oracle
+            .visit_coreset_neighbourhoods_with_target_indices(
+                coreset.nodes.as_slice(),
+                |row_idx, target_idx, node, weight| {
+                    if visitor_error.is_some() {
+                        return;
+                    }
+                    if row_idx >= n {
+                        visitor_error = Some(format!(
+                            "coreset graph lookup returned row index {row_idx} for {n} rows"
+                        ));
+                        return;
+                    }
+                    if target_idx >= n {
+                        visitor_error = Some(format!(
+                            "coreset graph lookup returned target index {target_idx} for {n} targets"
+                        ));
+                        return;
+                    }
+                    if row_idx < current_row {
+                        visitor_error = Some(format!(
+                            "coreset graph lookup visited row {row_idx} after row {current_row}"
+                        ));
+                        return;
+                    }
+
+                    while current_row < row_idx {
+                        coreset
+                            .coreset_neighbourhood_offsets
+                            .push(coreset.coreset_neighbourhood_data.len());
+                        current_row += 1;
+                    }
+
+                    coreset.coreset_neighbourhood_data.push((node, weight));
+                    coreset_neighbourhood_index_data.push((target_idx, weight));
+                },
+            )
+            .map_err(|e| anyhow!("coreset graph lookup: {e}"))?;
+
+        if let Some(error) = visitor_error {
+            return Err(anyhow!("{error}"));
+        }
+        debug_assert_eq!(visited_edges, coreset_neighbourhood_index_data.len());
+        debug_assert_eq!(
+            coreset.coreset_neighbourhood_data.len(),
+            coreset_neighbourhood_index_data.len()
+        );
+
+        while coreset.coreset_neighbourhood_offsets.len() < n + 1 {
+            coreset
+                .coreset_neighbourhood_offsets
+                .push(coreset.coreset_neighbourhood_data.len());
+        }
 
         // For each coreset node i, precompute W_C[i] * D_C[i]^{-1}.
         // Here W_C is the diagonal matrix of coreset weights and D_C is the
@@ -605,33 +944,29 @@ where
         // - W_C is the diagonal matrix of coreset weights,
         // - D_C is the degree diagonal restricted to coreset nodes,
         // - sigma is the regularising diagonal shift.
-        for (i, (&node_name, neighbours)) in coreset
-            .nodes
-            .iter()
-            .zip(coreset_neighbourhoods.iter())
-            .enumerate()
-        {
+        for i in 0..n {
             let weight_degree_inv_i = weight_degree_inv[i];
             let mut no_diag = true;
-            let mut row_entries = neighbours
+            let row_start = coreset.coreset_neighbourhood_offsets[i];
+            let row_end = coreset.coreset_neighbourhood_offsets[i + 1];
+            let mut row_entries = coreset_neighbourhood_index_data[row_start..row_end]
                 .iter()
-                .filter_map(|(neighbour_name, edge_weight)| {
-                    let coreset_j = *node_name_to_index.get(neighbour_name)?;
+                .map(|(coreset_j, edge_weight)| {
                     let edge_weight = edge_weight.into_scalar();
-                    if node_name == *neighbour_name {
+                    if i == *coreset_j {
                         no_diag = false;
-                        Some((
-                            coreset_j,
+                        (
+                            *coreset_j,
                             edge_weight * weight_degree_inv_i * weight_degree_inv_i
                                 + sigma.into_scalar()
                                     * coreset.weights[i].into_scalar()
                                     * weight_degree_inv_i,
-                        ))
+                        )
                     } else {
-                        Some((
-                            coreset_j,
-                            edge_weight * weight_degree_inv_i * weight_degree_inv[coreset_j],
-                        ))
+                        (
+                            *coreset_j,
+                            edge_weight * weight_degree_inv_i * weight_degree_inv[*coreset_j],
+                        )
                     }
                 })
                 .collect::<Vec<(usize, T)>>();
@@ -675,6 +1010,36 @@ where
         V: Send + Sync,
         T: Send + Sync,
     {
+        let mut timing = FullGraphLabelTiming::default();
+        self.rust_label_full_graph_timed(
+            coreset,
+            num_clusters,
+            graph_oracle,
+            nodes,
+            sigma,
+            &mut timing,
+        )
+    }
+
+    pub(crate) fn rust_label_full_graph_timed<G, E>(
+        &self,
+        coreset: &Coreset<V, T>,
+        num_clusters: usize,
+        graph_oracle: &mut G,
+        nodes: &[V],
+        sigma: Strict<T>,
+        timing: &mut FullGraphLabelTiming,
+    ) -> Result<(Vec<V>, Vec<usize>, Vec<T>)>
+    where
+        G: GraphOracle<V, T, E> + ?Sized,
+        E: std::fmt::Display,
+        V: Send + Sync,
+        T: Send + Sync,
+    {
+        let total_started = timing_start!();
+        *timing = FullGraphLabelTiming::default();
+
+        let setup_started = timing_start!();
         if num_clusters == 0 {
             return Err(anyhow!(
                 "full graph labelling requires at least one cluster"
@@ -702,15 +1067,20 @@ where
         }
 
         let node_names = nodes.to_vec();
+        timing_add!(timing.labelled_nodes, node_names.len());
+        timing_add!(timing.coreset_nodes, coreset.nodes.len());
 
         // Union of all nodes we will touch: labelled nodes plus coreset nodes.
         // This deduplicates the graph-wide neighbourhood batch lookup.
         let mut all_nodes_set: FxHashSet<V> = node_names.iter().copied().collect();
         all_nodes_set.extend(coreset.nodes.iter().copied());
         let all_nodes: Vec<V> = all_nodes_set.iter().copied().collect();
+        timing_add!(timing.degree_nodes, all_nodes.len());
+        timing_add_elapsed!(timing.setup, setup_started);
 
         // Precompute degree lookups to avoid touching the main data structures
         // inside parallel labelling loops.
+        let degree_lookup_started = timing_start!();
         let mut degree_map = FxHashMap::<V, T>::default();
         for node in all_nodes.iter().copied() {
             let idx = *self
@@ -719,44 +1089,70 @@ where
                 .ok_or_else(|| anyhow!("full graph labelling node was missing from the tree"))?;
             degree_map.insert(node, self.persistent.volume[idx].into_scalar());
         }
+        timing_add_elapsed!(timing.degree_lookup, degree_lookup_started);
 
-        let (center_norms, center_denoms) = {
-            let coreset_neighbourhoods = lookup_graph_neighbourhoods_intersecting(
-                graph_oracle,
-                coreset.nodes.as_slice(),
-                coreset.nodes.as_slice(),
-                "full graph coreset lookup",
-            )?;
-            let coreset_rows = coreset_neighbourhoods.iter().collect::<Vec<_>>();
-            self.compute_full_graph_center_stats(
-                coreset,
-                num_clusters,
-                coreset_labels,
-                &degree_map,
-                &coreset_rows,
-            )?
-        };
+        let (center_norms, center_denoms) =
+            if let Some(coreset_rows) = coreset.cached_coreset_neighbourhood_rows() {
+                let coreset_row_collect_started = timing_start!();
+                timing_add!(
+                    timing.coreset_lookup_edges,
+                    coreset_rows.iter().map(|row| row.len()).sum::<usize>()
+                );
+                timing_add_elapsed!(timing.coreset_row_collect, coreset_row_collect_started);
 
-        let labels_and_distances = {
-            let query_neighbourhoods = lookup_graph_neighbourhoods_intersecting(
-                graph_oracle,
-                node_names.as_slice(),
-                coreset.nodes.as_slice(),
-                "full graph query lookup",
-            )?;
-            let query_rows = query_neighbourhoods.iter().collect::<Vec<_>>();
-            self.label_full_graph_nodes_from_centers(
-                node_names.as_slice(),
-                &query_rows,
-                coreset,
-                coreset_labels,
-                &degree_map,
-                &center_norms,
-                &center_denoms,
-                shift,
-            )?
-        };
+                let center_stats_started = timing_start!();
+                let center_stats = self.compute_full_graph_center_stats(
+                    coreset,
+                    num_clusters,
+                    coreset_labels,
+                    &degree_map,
+                    &coreset_rows,
+                )?;
+                timing_add_elapsed!(timing.center_stats, center_stats_started);
+                center_stats
+            } else {
+                let coreset_lookup_started = timing_start!();
+                let coreset_neighbourhoods = lookup_graph_neighbourhoods_intersecting(
+                    graph_oracle,
+                    coreset.nodes.as_slice(),
+                    coreset.nodes.as_slice(),
+                    "full graph coreset lookup",
+                )?;
+                timing_add_elapsed!(timing.coreset_lookup, coreset_lookup_started);
 
+                let coreset_row_collect_started = timing_start!();
+                let coreset_rows = coreset_neighbourhoods.iter().collect::<Vec<_>>();
+                timing_add!(
+                    timing.coreset_lookup_edges,
+                    coreset_rows.iter().map(|row| row.len()).sum::<usize>()
+                );
+                timing_add_elapsed!(timing.coreset_row_collect, coreset_row_collect_started);
+
+                let center_stats_started = timing_start!();
+                let center_stats = self.compute_full_graph_center_stats(
+                    coreset,
+                    num_clusters,
+                    coreset_labels,
+                    &degree_map,
+                    &coreset_rows,
+                )?;
+                timing_add_elapsed!(timing.center_stats, center_stats_started);
+                center_stats
+            };
+
+        let labels_and_distances = self.label_full_graph_nodes_from_centers_timed(
+            graph_oracle,
+            node_names.as_slice(),
+            coreset,
+            coreset_labels,
+            &degree_map,
+            &center_norms,
+            &center_denoms,
+            shift,
+            timing,
+        )?;
+
+        timing_add_elapsed!(timing.total, total_started);
         Ok((node_names, labels_and_distances.0, labels_and_distances.1))
     }
 
@@ -870,28 +1266,24 @@ where
         Ok(result.into_iter().unzip())
     }
 
-    fn label_full_graph_nodes_from_centers(
+    fn label_full_graph_nodes_from_centers_timed<G, E>(
         &self,
+        graph_oracle: &mut G,
         node_names: &[V],
-        query_rows: &[&[(V, Strict<T>)]],
         coreset: &Coreset<V, T>,
         coreset_labels: &[usize],
         degree_map: &FxHashMap<V, T>,
         center_norms: &[T],
         center_denoms: &[T],
         shift: T,
+        timing: &mut FullGraphLabelTiming,
     ) -> Result<(Vec<usize>, Vec<T>)>
     where
+        G: GraphOracle<V, T, E> + ?Sized,
+        E: std::fmt::Display,
         V: Send + Sync,
         T: Send + Sync,
     {
-        if node_names.len() != query_rows.len() {
-            return Err(anyhow!(
-                "full graph labelling expected one row per labelled node; got nodes={}, rows={}",
-                node_names.len(),
-                query_rows.len()
-            ));
-        }
         if center_norms.len() != center_denoms.len() {
             return Err(anyhow!(
                 "full graph labelling expected matching center norm/denom lengths; got norms={}, denoms={}",
@@ -910,26 +1302,43 @@ where
             }
         }
 
-        let target_info = coreset
+        let num_centers = center_norms.len();
+        let target_info_started = timing_start!();
+        let mut target_labels = Vec::with_capacity(coreset.nodes.len());
+        let mut target_weights = Vec::with_capacity(coreset.nodes.len());
+        let mut target_degrees = Vec::with_capacity(coreset.nodes.len());
+        for ((node, label), weight) in coreset
             .nodes
             .iter()
             .copied()
             .zip(coreset_labels.iter().copied())
             .zip(coreset.weights.iter())
-            .map(|((node, label), weight)| {
-                let degree = *degree_map
-                    .get(&node)
-                    .expect("degree missing for coreset neighbour");
-                (
-                    node,
-                    CoresetProjectionInfo {
-                        label,
-                        weight: weight.into_scalar(),
-                        degree,
-                    },
-                )
+        {
+            if label >= num_centers {
+                return Err(anyhow!(
+                    "coreset label {} was outside the cluster range 0..{}",
+                    label,
+                    num_centers
+                ));
+            }
+            let degree = *degree_map
+                .get(&node)
+                .expect("degree missing for coreset neighbour");
+            target_labels.push(label);
+            target_weights.push(weight.into_scalar());
+            target_degrees.push(degree);
+        }
+        timing_add_elapsed!(timing.target_info, target_info_started);
+
+        let labelled_degrees = node_names
+            .iter()
+            .map(|node| {
+                degree_map
+                    .get(node)
+                    .copied()
+                    .ok_or_else(|| anyhow!("degree missing for node in labelling pass"))
             })
-            .collect::<FxHashMap<_, _>>();
+            .collect::<Result<Vec<_>>>()?;
 
         // For each labelled node x, compute normalized inner products
         //   <phi(x), c_l> = denom_l^{-1} sum_{j in C_l} w_j k(x,j)
@@ -940,54 +1349,57 @@ where
         // score constant. The constant is independent of the candidate center,
         // so it is useful for comparable scores but must not influence label
         // selection.
-        let labels_and_distances: (Vec<usize>, Vec<T>) = node_names
-            .par_iter()
-            .zip(query_rows.par_iter())
-            .map(|i| {
-                let (i, neighbours) = i;
-                let vertex_degree = *degree_map
-                    .get(i)
-                    .expect("degree missing for node in labelling pass");
-                let mut x_to_c_is: FxHashMap<usize, T> = FxHashMap::default();
+        let mut center_scores = vec![T::ZERO; node_names.len() * num_centers];
 
-                neighbours.iter().for_each(|(neighbour, edge_weight)| {
-                    let info = target_info
-                        .get(neighbour)
-                        .expect("intersecting oracle returned a non-coreset neighbour");
+        let query_lookup_started = timing_start!();
+        let query_lookup_edges = graph_oracle
+            .visit_graph_neighbourhoods_intersecting_with_target_indices(
+                node_names,
+                coreset.nodes.as_slice(),
+                |row_idx, target_idx, _neighbour, edge_weight| {
+                    debug_assert!(row_idx < node_names.len());
+                    debug_assert!(target_idx < target_labels.len());
 
+                    let vertex_degree = labelled_degrees[row_idx];
                     let inner_prod_with_vertex =
-                        edge_weight.into_scalar() / (vertex_degree * info.degree);
+                        edge_weight.into_scalar() / (vertex_degree * target_degrees[target_idx]);
+                    let label = target_labels[target_idx];
+                    let offset = row_idx * num_centers + label;
+                    center_scores[offset] =
+                        center_scores[offset] + target_weights[target_idx] * inner_prod_with_vertex;
+                },
+            )
+            .map_err(|e| anyhow!("full graph query lookup: {e}"))?;
+        timing_add_elapsed!(timing.query_lookup, query_lookup_started);
+        timing_add!(timing.query_lookup_edges, query_lookup_edges);
 
-                    x_to_c_is
-                        .entry(info.label)
-                        .and_modify(|e| {
-                            *e = *e + info.weight * inner_prod_with_vertex;
-                        })
-                        .or_insert(info.weight * inner_prod_with_vertex);
-                });
-
-                x_to_c_is.iter_mut().for_each(|(k, v)| {
-                    let denom = center_denoms[*k];
-                    if denom.is_finite() && denom != T::ZERO {
-                        *v = *v / denom;
-                    } else {
-                        *v = T::ZERO;
-                    }
-                });
-
+        let label_nodes_started = timing_start!();
+        let labels_and_distances: (Vec<usize>, Vec<T>) = (0..node_names.len())
+            .into_par_iter()
+            .map(|row_idx| {
+                let vertex_degree = labelled_degrees[row_idx];
+                let row_start = row_idx * num_centers;
+                let row_scores = &center_scores[row_start..row_start + num_centers];
                 let mut best_center_value = smallest_center_by_norm_value;
                 let mut best_center = smallest_center_by_norm;
 
-                x_to_c_is
-                    .iter()
-                    .filter(|(center, _)| center_norms[**center].is_finite())
-                    .for_each(|(center, v)| {
-                        let distance = center_norms[*center] - (T::ONE + T::ONE) * *v;
-                        if distance < best_center_value {
-                            best_center = *center;
-                            best_center_value = distance;
-                        }
-                    });
+                for center in 0..num_centers {
+                    if !center_norms[center].is_finite() {
+                        continue;
+                    }
+                    let denom = center_denoms[center];
+                    let inner_prod_with_center = if denom.is_finite() && denom != T::ZERO {
+                        row_scores[center] / denom
+                    } else {
+                        T::ZERO
+                    };
+                    let distance =
+                        center_norms[center] - (T::ONE + T::ONE) * inner_prod_with_center;
+                    if distance < best_center_value {
+                        best_center = center;
+                        best_center_value = distance;
+                    }
+                }
 
                 (
                     best_center,
@@ -997,6 +1409,7 @@ where
                 )
             })
             .unzip();
+        timing_add_elapsed!(timing.label_nodes, label_nodes_started);
 
         Ok(labels_and_distances)
     }

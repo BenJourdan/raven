@@ -95,6 +95,12 @@ where
                     || query_time.f_delta.len() != tree_len
                     || query_time.h_b.len() != tree_len
                     || query_time.h_s.len() != tree_len
+                    || query_time.seed_owner.len() != tree_len
+                    || query_time.seed_owner_epoch.len() != tree_len
+                    || query_time.seed_weight.len() != tree_len
+                    || query_time.seed_weight_epoch.len() != tree_len
+                    || query_time.old_seed_seen.len() != tree_len
+                    || query_time.tree_update_seen.len() != tree_len
             }) {
                 return Err(anyhow!(
                     "query time arrays are not the right length: expected {}, got {:?}",
@@ -107,6 +113,12 @@ where
                             qt.f_delta.len(),
                             qt.h_b.len(),
                             qt.h_s.len(),
+                            qt.seed_owner.len(),
+                            qt.seed_owner_epoch.len(),
+                            qt.seed_weight.len(),
+                            qt.seed_weight_epoch.len(),
+                            qt.old_seed_seen.len(),
+                            qt.tree_update_seen.len(),
                         ))
                         .collect::<Vec<_>>()
                 ));
@@ -171,7 +183,7 @@ where
                 let mut rng = rng_mode.rng_for_trial(trial_index);
 
                 let extract_started = Instant::now();
-                let mut coreset = context.extract_coreset_trial(
+                let mut coreset = context.extract_coreset_trial_timed(
                     &mut **oracle,
                     sigma,
                     x_star,
@@ -179,12 +191,13 @@ where
                     coreset_size,
                     sampling_seeds,
                     &mut rng,
+                    &mut timing.extract_coreset_breakdown,
                 )?;
                 timing.extract_coreset = extract_started.elapsed();
 
                 let build_started = Instant::now();
                 let mut coreset_graph =
-                    context.build_coreset_graph(&coreset, &mut **oracle, sigma)?;
+                    context.build_coreset_graph(&mut coreset, &mut **oracle, sigma)?;
                 timing.build_coreset_graph = build_started.elapsed();
 
                 let cluster_started = Instant::now();
@@ -204,22 +217,24 @@ where
                 let label_started = Instant::now();
                 let (labels, scores) = match partition {
                     PartitionType::All => {
-                        let (_nodes, labels, scores) = context.rust_label_full_graph(
+                        let (_nodes, labels, scores) = context.rust_label_full_graph_timed(
                             &coreset,
                             num_clusters,
                             &mut **oracle,
                             node_names.as_ref().unwrap().as_slice(),
                             sigma,
+                            &mut timing.label_breakdown,
                         )?;
                         (labels, scores)
                     }
                     PartitionType::Subset(nodes) => {
-                        let (_nodes, labels, scores) = context.rust_label_full_graph(
+                        let (_nodes, labels, scores) = context.rust_label_full_graph_timed(
                             &coreset,
                             num_clusters,
                             &mut **oracle,
                             nodes,
                             sigma,
+                            &mut timing.label_breakdown,
                         )?;
                         (labels, scores)
                     }

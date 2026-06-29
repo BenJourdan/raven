@@ -97,24 +97,151 @@ pub struct QueryTiming {
 pub struct QueryTrialTiming {
     pub total: Duration,
     pub extract_coreset: Duration,
+    pub extract_coreset_breakdown: CoresetExtractionTiming,
     pub build_coreset_graph: Duration,
     pub cluster_coreset: Duration,
     pub label_partition: Duration,
+    pub label_breakdown: FullGraphLabelTiming,
 }
 
-// Holds info for coreset construction.
-pub struct SamplingInfo<V, T> {
-    pub x_star: V,
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FullGraphLabelTiming {
+    pub total: Duration,
+    pub setup: Duration,
+    pub degree_lookup: Duration,
+    pub coreset_lookup: Duration,
+    pub coreset_row_collect: Duration,
+    pub center_stats: Duration,
+    pub query_lookup: Duration,
+    pub query_row_collect: Duration,
+    pub target_info: Duration,
+    pub label_nodes: Duration,
+
+    pub labelled_nodes: usize,
+    pub coreset_nodes: usize,
+    pub degree_nodes: usize,
+    pub coreset_lookup_edges: usize,
+    pub query_lookup_edges: usize,
+}
+
+impl FullGraphLabelTiming {
+    pub fn add(&mut self, other: Self) {
+        self.total += other.total;
+        self.setup += other.setup;
+        self.degree_lookup += other.degree_lookup;
+        self.coreset_lookup += other.coreset_lookup;
+        self.coreset_row_collect += other.coreset_row_collect;
+        self.center_stats += other.center_stats;
+        self.query_lookup += other.query_lookup;
+        self.query_row_collect += other.query_row_collect;
+        self.target_info += other.target_info;
+        self.label_nodes += other.label_nodes;
+
+        self.labelled_nodes += other.labelled_nodes;
+        self.coreset_nodes += other.coreset_nodes;
+        self.degree_nodes += other.degree_nodes;
+        self.coreset_lookup_edges += other.coreset_lookup_edges;
+        self.query_lookup_edges += other.query_lookup_edges;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CoresetExtractionTiming {
+    pub setup: Duration,
+    pub initial_repairs: Duration,
+    pub seed_sampling: Duration,
+    pub seed_repairs: Duration,
+    pub total_contribution: Duration,
+    pub smoothed_sampling: Duration,
+    pub deduplication: Duration,
+
+    pub initial_repair_calls: usize,
+    pub seed_repair_calls: usize,
+    pub seed_samples: usize,
+    pub smoothed_samples: usize,
+    pub dedup_unique_nodes: usize,
+
+    pub repair_calls: usize,
+    pub repair_point_seed_move: Duration,
+    pub repair_point_f_delta: Duration,
+    pub repair_point_lookup: Duration,
+    pub repair_neighbour_scan: Duration,
+    pub repair_neighbour_lookup: Duration,
+    pub repair_neighbour_compare: Duration,
+    pub repair_neighbour_f_delta_write: Duration,
+    pub repair_neighbour_seed_move: Duration,
+    pub repair_neighbour_f_delta_recompute: Duration,
+    pub repair_new_seed_h_update: Duration,
+    pub repair_new_seed_h_write: Duration,
+    pub repair_new_seed_h_recompute: Duration,
+    pub repair_old_seed_prepare: Duration,
+    pub repair_old_seed_lookup: Duration,
+    pub repair_old_seed_rescale: Duration,
+    pub repair_old_seed_h_recompute: Duration,
+    pub repair_neighbours_scanned: usize,
+    pub repair_neighbours_improved: usize,
+    pub repair_new_seed_h_update_nodes: usize,
+    pub repair_old_seed_count: usize,
+    pub repair_old_seed_neighbours_scanned: usize,
+    pub repair_old_seed_neighbours_rescaled: usize,
+    pub repair_old_seed_h_update_nodes: usize,
+}
+
+impl CoresetExtractionTiming {
+    pub fn add(&mut self, other: Self) {
+        self.setup += other.setup;
+        self.initial_repairs += other.initial_repairs;
+        self.seed_sampling += other.seed_sampling;
+        self.seed_repairs += other.seed_repairs;
+        self.total_contribution += other.total_contribution;
+        self.smoothed_sampling += other.smoothed_sampling;
+        self.deduplication += other.deduplication;
+
+        self.initial_repair_calls += other.initial_repair_calls;
+        self.seed_repair_calls += other.seed_repair_calls;
+        self.seed_samples += other.seed_samples;
+        self.smoothed_samples += other.smoothed_samples;
+        self.dedup_unique_nodes += other.dedup_unique_nodes;
+
+        self.repair_calls += other.repair_calls;
+        self.repair_point_seed_move += other.repair_point_seed_move;
+        self.repair_point_f_delta += other.repair_point_f_delta;
+        self.repair_point_lookup += other.repair_point_lookup;
+        self.repair_neighbour_scan += other.repair_neighbour_scan;
+        self.repair_neighbour_lookup += other.repair_neighbour_lookup;
+        self.repair_neighbour_compare += other.repair_neighbour_compare;
+        self.repair_neighbour_f_delta_write += other.repair_neighbour_f_delta_write;
+        self.repair_neighbour_seed_move += other.repair_neighbour_seed_move;
+        self.repair_neighbour_f_delta_recompute += other.repair_neighbour_f_delta_recompute;
+        self.repair_new_seed_h_update += other.repair_new_seed_h_update;
+        self.repair_new_seed_h_write += other.repair_new_seed_h_write;
+        self.repair_new_seed_h_recompute += other.repair_new_seed_h_recompute;
+        self.repair_old_seed_prepare += other.repair_old_seed_prepare;
+        self.repair_old_seed_lookup += other.repair_old_seed_lookup;
+        self.repair_old_seed_rescale += other.repair_old_seed_rescale;
+        self.repair_old_seed_h_recompute += other.repair_old_seed_h_recompute;
+        self.repair_neighbours_scanned += other.repair_neighbours_scanned;
+        self.repair_neighbours_improved += other.repair_neighbours_improved;
+        self.repair_new_seed_h_update_nodes += other.repair_new_seed_h_update_nodes;
+        self.repair_old_seed_count += other.repair_old_seed_count;
+        self.repair_old_seed_neighbours_scanned += other.repair_old_seed_neighbours_scanned;
+        self.repair_old_seed_neighbours_rescaled += other.repair_old_seed_neighbours_rescaled;
+        self.repair_old_seed_h_update_nodes += other.repair_old_seed_h_update_nodes;
+    }
+
+    pub fn repair_wall(self) -> Duration {
+        self.initial_repairs + self.seed_repairs
+    }
+}
+
+/// Query-local metadata for coreset construction.
+pub struct SamplingInfo<T> {
+    pub x_star_idx: TreeIndex,
     pub sigma: Strict<T>,
     pub sigma_over_x_star_deg: Strict<T>,
     pub timestamp: usize,
     pub x_star_seed_set_volume_inv: Strict<T>,
     pub total_contribution_inv: Option<Contribution<T>>,
-
-    // store the weight of each seed
-    seed_weight: FxHashMap<V, Strict<T>>,
-    // lazy seed map for every node
-    seed_map: FxHashMap<V, V>,
 }
 
 struct ClassifiedNodeOps<V, T> {

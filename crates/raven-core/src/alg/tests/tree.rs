@@ -5,7 +5,7 @@ use rustc_hash::FxHashSet;
 use super::common::*;
 use crate::{
     DynamicClusteringAlg,
-    alg::DynamicClustering,
+    alg::{DynamicClustering, TreeLayout},
     types::{NodeDegree, TreeIndex},
 };
 
@@ -38,6 +38,43 @@ fn binary_layout_degenerates_to_standard_heap_shape() {
         assert_eq!(D2::total_count_for_leaves(leaves), 2 * leaves - 1);
         assert_eq!(D2::leaf_start_for_leaves(leaves), leaves - 1);
     }
+}
+
+#[test]
+fn tree_update_marker_dedups_frontiers_without_skipping_bottom_parent_updates() {
+    let mut current = Vec::new();
+    let mut next = Vec::new();
+    let mut seen = vec![0; 7];
+    let mut epoch = 0;
+    let mut visited = Vec::new();
+
+    TreeLayout::<2>::apply_updates_from_slice_with_marker(
+        7,
+        &[TreeIndex(1), TreeIndex(3), TreeIndex(4), TreeIndex(4)],
+        &mut current,
+        &mut next,
+        &mut seen,
+        &mut epoch,
+        |idx| visited.push(idx),
+    );
+
+    assert_eq!(visited, vec![TreeIndex(1), TreeIndex(0)]);
+
+    let mut visited_after_overflow = Vec::new();
+    epoch = usize::MAX;
+    seen.fill(usize::MAX);
+    TreeLayout::<2>::apply_updates_from_slice_with_marker(
+        7,
+        &[TreeIndex(3), TreeIndex(4)],
+        &mut current,
+        &mut next,
+        &mut seen,
+        &mut epoch,
+        |idx| visited_after_overflow.push(idx),
+    );
+
+    assert_eq!(visited_after_overflow, vec![TreeIndex(1), TreeIndex(0)]);
+    assert_eq!(epoch, 3);
 }
 
 #[test]

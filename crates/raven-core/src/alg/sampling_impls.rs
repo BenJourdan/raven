@@ -17,7 +17,7 @@ where
 {
     /// Get the base f contribution for a node.
     #[inline(always)]
-    pub fn f_b(&self, node_idx: TreeIndex, info: &SamplingInfo<V, T>) -> Strict<T> {
+    pub fn f_b(&self, node_idx: TreeIndex, info: &SamplingInfo<T>) -> Strict<T> {
         // f_b = sigma* size + (sigma * vol)/deg(x^*)
 
         let size = (Strict::<T>::from_non_zero_usize(self.persistent.size[node_idx])).into_scalar();
@@ -32,7 +32,7 @@ where
 
     // Get the delta f contribution for a node.
     #[inline(always)]
-    pub fn f_delta_read(&self, node_idx: TreeIndex, info: &SamplingInfo<V, T>) -> FDelta<T> {
+    pub fn f_delta_read(&self, node_idx: TreeIndex, info: &SamplingInfo<T>) -> FDelta<T> {
         // return saved f_delta if timestamps match, else return 0.
         if self.query_time.timestamp[node_idx] == info.timestamp {
             self.query_time.f_delta[node_idx]
@@ -43,7 +43,7 @@ where
 
     /// Get the f contribution for a node
     #[inline(always)]
-    pub fn f(&self, node_idx: TreeIndex, info: &SamplingInfo<V, T>) -> Contribution<T> {
+    pub fn f(&self, node_idx: TreeIndex, info: &SamplingInfo<T>) -> Contribution<T> {
         // f_s = f_b - f_delta
         let f_b = self.f_b(node_idx, info).into_scalar();
         let f_delta = self.f_delta_read(node_idx, info).into_scalar();
@@ -60,7 +60,7 @@ where
         &self,
         output_buffer: &mut [NonStrict<T>; ARITY],
         parent_idx: TreeIndex,
-        info: &SamplingInfo<V, T>,
+        info: &SamplingInfo<T>,
     ) -> usize {
         let start = TreeLayout::<ARITY>::child_index(parent_idx, 0).0;
         let end = (start + ARITY).min(self.persistent.size.len());
@@ -104,7 +104,7 @@ where
     }
 
     #[inline(always)]
-    pub fn h_b(&self, node_idx: TreeIndex, info: &SamplingInfo<V, T>) -> HB<T> {
+    pub fn h_b(&self, node_idx: TreeIndex, info: &SamplingInfo<T>) -> HB<T> {
         let saved_timestamp = self.query_time.timestamp[node_idx];
         let cur_timestamp = info.timestamp;
         let saved_h_b = self.query_time.h_b[node_idx];
@@ -119,7 +119,7 @@ where
     }
 
     #[inline(always)]
-    pub fn h_s(&self, node_idx: TreeIndex, info: &SamplingInfo<V, T>) -> HS<T> {
+    pub fn h_s(&self, node_idx: TreeIndex, info: &SamplingInfo<T>) -> HS<T> {
         let saved_timestamp = self.query_time.timestamp[node_idx];
         let cur_timestamp = info.timestamp;
         let saved_h_s = self.query_time.h_s[node_idx];
@@ -133,7 +133,7 @@ where
     }
 
     #[inline(always)]
-    pub fn g(&self, node_idx: TreeIndex, info: &SamplingInfo<V, T>) -> SmoothedContribution<T> {
+    pub fn g(&self, node_idx: TreeIndex, info: &SamplingInfo<T>) -> SmoothedContribution<T> {
         // g = f(S)/f(X) + h_b(S)/w(C(x^*)) + h_s(S)
 
         let f_s = self.f(node_idx, info).0.into_scalar();
@@ -158,7 +158,7 @@ where
         &self,
         output_buffer: &mut [NonStrict<T>; ARITY],
         parent_idx: TreeIndex,
-        info: &SamplingInfo<V, T>,
+        info: &SamplingInfo<T>,
     ) -> usize {
         let start = TreeLayout::<ARITY>::child_index(parent_idx, 0).0;
         let end = (start + ARITY).min(self.persistent.size.len());
@@ -220,9 +220,9 @@ where
 
     fn sample_impl(
         &mut self,
-        info: &SamplingInfo<V, T>,
+        info: &SamplingInfo<T>,
         rng: &mut impl rand::Rng,
-        fill: impl Fn(&Self, &mut [NonStrict<T>; ARITY], TreeIndex, &SamplingInfo<V, T>) -> usize,
+        fill: impl Fn(&Self, &mut [NonStrict<T>; ARITY], TreeIndex, &SamplingInfo<T>) -> usize,
     ) -> Result<(V, TreeIndex, NonStrict<T>)> {
         if self.persistent.size.is_empty() {
             return Err(anyhow!("Cannot sample from an empty tree."));
@@ -279,7 +279,7 @@ where
 
     pub fn sample(
         &mut self,
-        info: &SamplingInfo<V, T>,
+        info: &SamplingInfo<T>,
         rng: &mut impl rand::Rng,
     ) -> Result<(V, TreeIndex, NonStrict<T>)> {
         self.sample_impl(info, rng, |this, buf, parent, info| {
@@ -289,7 +289,7 @@ where
 
     pub fn sample_smoothed(
         &mut self,
-        info: &SamplingInfo<V, T>,
+        info: &SamplingInfo<T>,
         rng: &mut impl rand::Rng,
     ) -> Result<(V, TreeIndex, NonStrict<T>)> {
         self.sample_impl(info, rng, |this, buf, parent, info| {

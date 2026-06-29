@@ -9,6 +9,7 @@ default = []
 clustering = [
   "dep:leiden-rs",
 ]
+deep-query-timing = []
 
 [dependencies]
 anyhow = "1.0.102"
