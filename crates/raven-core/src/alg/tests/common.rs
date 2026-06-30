@@ -135,6 +135,10 @@ pub(crate) fn assert_tree_consistent(clustering: &TestClustering) {
         assert_eq!(query_time.f_delta.len(), total);
         assert_eq!(query_time.h_b.len(), total);
         assert_eq!(query_time.h_s.len(), total);
+        assert_eq!(query_time.coreset_sample_weight.len(), total);
+        assert_eq!(query_time.coreset_sample_epoch.len(), total);
+        assert_eq!(query_time.smoothed_mass.len(), total);
+        assert_eq!(query_time.smoothed_mass_epoch.len(), total);
     }
 
     assert_eq!(clustering.node_to_tree_map.len(), leaves);

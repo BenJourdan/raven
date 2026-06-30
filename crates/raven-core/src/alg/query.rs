@@ -99,6 +99,10 @@ where
                     || query_time.seed_owner_epoch.len() != tree_len
                     || query_time.seed_weight.len() != tree_len
                     || query_time.seed_weight_epoch.len() != tree_len
+                    || query_time.coreset_sample_weight.len() != tree_len
+                    || query_time.coreset_sample_epoch.len() != tree_len
+                    || query_time.smoothed_mass.len() != tree_len
+                    || query_time.smoothed_mass_epoch.len() != tree_len
                     || query_time.old_seed_seen.len() != tree_len
                     || query_time.tree_update_seen.len() != tree_len
             }) {
@@ -108,7 +112,7 @@ where
                     self.tree_data
                         .query_time
                         .iter()
-                        .map(|qt| (
+                        .map(|qt| vec![
                             qt.timestamp.len(),
                             qt.f_delta.len(),
                             qt.h_b.len(),
@@ -117,9 +121,13 @@ where
                             qt.seed_owner_epoch.len(),
                             qt.seed_weight.len(),
                             qt.seed_weight_epoch.len(),
+                            qt.coreset_sample_weight.len(),
+                            qt.coreset_sample_epoch.len(),
+                            qt.smoothed_mass.len(),
+                            qt.smoothed_mass_epoch.len(),
                             qt.old_seed_seen.len(),
                             qt.tree_update_seen.len(),
-                        ))
+                        ])
                         .collect::<Vec<_>>()
                 ));
             }

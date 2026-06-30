@@ -5,5 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-raven-core.workspace = true
+raven-core = { workspace = true, features = ["clustering"] }
 raven-adapters.workspace = true

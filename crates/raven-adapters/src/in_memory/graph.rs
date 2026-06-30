@@ -145,6 +145,10 @@ where
         self.graph.len()
     }
 
+    pub fn nodes(&self) -> impl Iterator<Item = V> + '_ {
+        self.graph.keys().copied()
+    }
+
     pub fn node_ops_buffer_len(&self) -> usize {
         self.node_ops.len()
     }

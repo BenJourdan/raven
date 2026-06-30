@@ -28,6 +28,12 @@ pub struct QueryTime<T> {
     pub seed_owner_epoch: Vec<usize>,
     pub seed_weight: Vec<T>,
     pub seed_weight_epoch: Vec<usize>,
+    pub coreset_sample_weight: Vec<T>,
+    pub coreset_sample_epoch: Vec<usize>,
+    pub coreset_sample_touched: Vec<TreeIndex>,
+    pub smoothed_mass: Vec<NonStrict<T>>,
+    pub smoothed_mass_epoch: Vec<usize>,
+    pub smoothed_mass_current_epoch: usize,
     pub old_seed_seen: Vec<usize>,
     pub old_seed_seen_epoch: usize,
     pub tree_update_current: Vec<TreeIndex>,
@@ -47,6 +53,12 @@ impl<T> Default for QueryTime<T> {
             seed_owner_epoch: Vec::new(),
             seed_weight: Vec::new(),
             seed_weight_epoch: Vec::new(),
+            coreset_sample_weight: Vec::new(),
+            coreset_sample_epoch: Vec::new(),
+            coreset_sample_touched: Vec::new(),
+            smoothed_mass: Vec::new(),
+            smoothed_mass_epoch: Vec::new(),
+            smoothed_mass_current_epoch: 0,
             old_seed_seen: Vec::new(),
             old_seed_seen_epoch: 0,
             tree_update_current: Vec::new(),
@@ -71,6 +83,12 @@ where
         self.seed_owner_epoch.clear();
         self.seed_weight.clear();
         self.seed_weight_epoch.clear();
+        self.coreset_sample_weight.clear();
+        self.coreset_sample_epoch.clear();
+        self.coreset_sample_touched.clear();
+        self.smoothed_mass.clear();
+        self.smoothed_mass_epoch.clear();
+        self.smoothed_mass_current_epoch = 0;
         self.old_seed_seen.clear();
         self.old_seed_seen_epoch = 0;
         self.tree_update_current.clear();
@@ -88,6 +106,11 @@ where
         self.seed_owner_epoch.truncate(new_len);
         self.seed_weight.truncate(new_len);
         self.seed_weight_epoch.truncate(new_len);
+        self.coreset_sample_weight.truncate(new_len);
+        self.coreset_sample_epoch.truncate(new_len);
+        self.coreset_sample_touched.clear();
+        self.smoothed_mass.truncate(new_len);
+        self.smoothed_mass_epoch.truncate(new_len);
         self.old_seed_seen.truncate(new_len);
         self.tree_update_seen.truncate(new_len);
     }
@@ -101,6 +124,10 @@ where
         self.seed_owner_epoch.resize(new_len, 0);
         self.seed_weight.resize(new_len, T::ZERO);
         self.seed_weight_epoch.resize(new_len, 0);
+        self.coreset_sample_weight.resize(new_len, T::ZERO);
+        self.coreset_sample_epoch.resize(new_len, 0);
+        self.smoothed_mass.resize_with(new_len, NonStrict::zero);
+        self.smoothed_mass_epoch.resize(new_len, 0);
         self.old_seed_seen.resize(new_len, 0);
         self.tree_update_seen.resize(new_len, 0);
     }

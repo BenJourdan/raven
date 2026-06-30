@@ -22,6 +22,18 @@ heaptrack.*
 *.callgrind
 callgrind.out.*
 
+# Python environments, caches, and local extension builds
+/.venv/
+/.pytest_cache/
+**/__pycache__/
+*.py[cod]
+*$py.class
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+/python/raven/_raven*.so
+
 # RustRover
 # JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 # be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

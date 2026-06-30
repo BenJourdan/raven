@@ -553,34 +553,43 @@ where
         let coreset_size_f =
             T::from(coreset_size.get()).expect("coreset size should convert to scalar");
         let smoothed_sampling_started = timing_start!();
-        let coreset_samples = (0..coreset_size.get())
-            .map(|_| {
-                let (node, idx, prob) = self.sample_smoothed(&info, rng).unwrap();
-                let node_deg = self.persistent.volume[idx].into_scalar();
-                let weight = node_deg / (prob.into_scalar() * coreset_size_f);
-                (node, idx, weight)
-            })
-            .collect::<Vec<_>>();
+        let smoothed_mass_epoch = self.next_smoothed_mass_epoch();
+        self.query_time.coreset_sample_touched.clear();
+        for _ in 0..coreset_size.get() {
+            let (idx, prob) = self
+                .sample_smoothed_index_cached(&info, rng, smoothed_mass_epoch)
+                .unwrap();
+            let node_deg = self.persistent.volume[idx].into_scalar();
+            let weight = node_deg / (prob.into_scalar() * coreset_size_f);
+            if self.query_time.coreset_sample_epoch[idx] != info.timestamp {
+                self.query_time.coreset_sample_epoch[idx] = info.timestamp;
+                self.query_time.coreset_sample_weight[idx] = T::ZERO;
+                self.query_time.coreset_sample_touched.push(idx);
+            }
+            self.query_time.coreset_sample_weight[idx] =
+                self.query_time.coreset_sample_weight[idx] + weight;
+        }
         timing_add_elapsed!(timing.smoothed_sampling, smoothed_sampling_started);
-        timing_add!(timing.smoothed_samples, coreset_samples.len());
+        timing_add!(timing.smoothed_samples, coreset_size.get());
 
         // Now we deduplicate the coreset:
         let dedup_started = timing_start!();
-        let mut coreset: FxHashMap<(V, TreeIndex), T> = FxHashMap::default();
-        for (v, index, weight) in coreset_samples {
-            let entry = coreset.entry((v, index)).or_insert(T::ZERO);
-            *entry = *entry + weight;
-        }
-
-        let mut unique_vs = Vec::with_capacity(coreset.len());
-        let mut unique_indices = Vec::with_capacity(coreset.len());
-        let mut weights = Vec::with_capacity(coreset.len());
-        for ((v, idx), weight) in coreset {
+        let unique_count = self.query_time.coreset_sample_touched.len();
+        let mut unique_vs = Vec::with_capacity(unique_count);
+        let mut unique_indices = Vec::with_capacity(unique_count);
+        let mut weights = Vec::with_capacity(unique_count);
+        for &idx in &self.query_time.coreset_sample_touched {
+            let weight = self.query_time.coreset_sample_weight[idx];
             debug_assert!(
                 weight.is_finite() && weight > T::ZERO,
                 "deduplicated coreset weight must be positive finite"
             );
-            unique_vs.push(v);
+            unique_vs.push(
+                *self
+                    .tree_to_node_map
+                    .get(&idx)
+                    .expect("sampled tree index should map to a node"),
+            );
             unique_indices.push(idx);
             weights.push(
                 Strict::<T>::from_positive_scalar(weight)

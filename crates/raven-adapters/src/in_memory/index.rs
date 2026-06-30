@@ -459,6 +459,18 @@ where
         self.graph.node_count()
     }
 
+    pub fn live_nodes(&self) -> Vec<V> {
+        self.graph
+            .nodes()
+            .map(|node| {
+                self.interner
+                    .external(node)
+                    .cloned()
+                    .expect("live internal node should have an external mapping")
+            })
+            .collect()
+    }
+
     pub fn last_query_timing(&self) -> Option<&QueryTiming> {
         self.clustering.last_query_timing()
     }

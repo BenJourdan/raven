@@ -75,6 +75,11 @@ fn query_time_resizes_dense_sampling_scratch() {
     assert_eq!(query_time.seed_owner_epoch.len(), 5);
     assert_eq!(query_time.seed_weight.len(), 5);
     assert_eq!(query_time.seed_weight_epoch.len(), 5);
+    assert_eq!(query_time.coreset_sample_weight.len(), 5);
+    assert_eq!(query_time.coreset_sample_epoch.len(), 5);
+    assert!(query_time.coreset_sample_touched.is_empty());
+    assert_eq!(query_time.smoothed_mass.len(), 5);
+    assert_eq!(query_time.smoothed_mass_epoch.len(), 5);
     assert_eq!(query_time.old_seed_seen.len(), 5);
     assert_eq!(query_time.tree_update_seen.len(), 5);
 
@@ -87,6 +92,11 @@ fn query_time_resizes_dense_sampling_scratch() {
     assert_eq!(query_time.seed_owner_epoch.len(), 3);
     assert_eq!(query_time.seed_weight.len(), 3);
     assert_eq!(query_time.seed_weight_epoch.len(), 3);
+    assert_eq!(query_time.coreset_sample_weight.len(), 3);
+    assert_eq!(query_time.coreset_sample_epoch.len(), 3);
+    assert!(query_time.coreset_sample_touched.is_empty());
+    assert_eq!(query_time.smoothed_mass.len(), 3);
+    assert_eq!(query_time.smoothed_mass_epoch.len(), 3);
     assert_eq!(query_time.old_seed_seen.len(), 3);
     assert_eq!(query_time.tree_update_seen.len(), 3);
 
@@ -99,6 +109,11 @@ fn query_time_resizes_dense_sampling_scratch() {
     assert!(query_time.seed_owner_epoch.is_empty());
     assert!(query_time.seed_weight.is_empty());
     assert!(query_time.seed_weight_epoch.is_empty());
+    assert!(query_time.coreset_sample_weight.is_empty());
+    assert!(query_time.coreset_sample_epoch.is_empty());
+    assert!(query_time.coreset_sample_touched.is_empty());
+    assert!(query_time.smoothed_mass.is_empty());
+    assert!(query_time.smoothed_mass_epoch.is_empty());
     assert!(query_time.old_seed_seen.is_empty());
     assert!(query_time.tree_update_seen.is_empty());
 }
@@ -421,6 +436,10 @@ fn query_succeeds_with_update_and_query_time_resize_modes() {
                     assert_eq!(query_time.seed_owner_epoch.len(), tree_len);
                     assert_eq!(query_time.seed_weight.len(), tree_len);
                     assert_eq!(query_time.seed_weight_epoch.len(), tree_len);
+                    assert_eq!(query_time.coreset_sample_weight.len(), tree_len);
+                    assert_eq!(query_time.coreset_sample_epoch.len(), tree_len);
+                    assert_eq!(query_time.smoothed_mass.len(), tree_len);
+                    assert_eq!(query_time.smoothed_mass_epoch.len(), tree_len);
                     assert_eq!(query_time.old_seed_seen.len(), tree_len);
                     assert_eq!(query_time.tree_update_seen.len(), tree_len);
                 }
@@ -433,6 +452,11 @@ fn query_succeeds_with_update_and_query_time_resize_modes() {
                     assert!(query_time.seed_owner_epoch.is_empty());
                     assert!(query_time.seed_weight.is_empty());
                     assert!(query_time.seed_weight_epoch.is_empty());
+                    assert!(query_time.coreset_sample_weight.is_empty());
+                    assert!(query_time.coreset_sample_epoch.is_empty());
+                    assert!(query_time.coreset_sample_touched.is_empty());
+                    assert!(query_time.smoothed_mass.is_empty());
+                    assert!(query_time.smoothed_mass_epoch.is_empty());
                     assert!(query_time.old_seed_seen.is_empty());
                     assert!(query_time.tree_update_seen.is_empty());
                 }
@@ -466,6 +490,10 @@ fn query_succeeds_with_update_and_query_time_resize_modes() {
             assert_eq!(query_time.seed_owner_epoch.len(), tree_len);
             assert_eq!(query_time.seed_weight.len(), tree_len);
             assert_eq!(query_time.seed_weight_epoch.len(), tree_len);
+            assert_eq!(query_time.coreset_sample_weight.len(), tree_len);
+            assert_eq!(query_time.coreset_sample_epoch.len(), tree_len);
+            assert_eq!(query_time.smoothed_mass.len(), tree_len);
+            assert_eq!(query_time.smoothed_mass_epoch.len(), tree_len);
             assert_eq!(query_time.old_seed_seen.len(), tree_len);
             assert_eq!(query_time.tree_update_seen.len(), tree_len);
         }

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "raven"
+version = "0.1.0"
+description = "Python bindings for the Raven dynamic graph clustering index"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = [
+    "numpy>=2.2.6",
+]
+
+[tool.maturin]
+manifest-path = "crates/raven-python/Cargo.toml"
+module-name = "raven._raven"
+python-source = "python"
+
+[tool.uv]
+dev-dependencies = [
+  "igraph>=1.0.0",
+  "maturin>=1.8,<2",
+  "plotly>=6.8.0",
+  "pytest>=8",
+  "scikit-learn>=1.7.2",
+  "tqdm>=4.68.3",
+]

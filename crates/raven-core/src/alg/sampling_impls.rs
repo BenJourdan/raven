@@ -218,12 +218,56 @@ where
         filled
     }
 
-    fn sample_impl(
+    pub(crate) fn next_smoothed_mass_epoch(&mut self) -> usize {
+        self.query_time.smoothed_mass_current_epoch = self
+            .query_time
+            .smoothed_mass_current_epoch
+            .checked_add(1)
+            .unwrap_or_else(|| {
+                self.query_time.smoothed_mass_epoch.fill(0);
+                1
+            });
+        self.query_time.smoothed_mass_current_epoch
+    }
+
+    #[inline(always)]
+    pub fn cached_smoothed_contribution_from_arrays(
+        &mut self,
+        output_buffer: &mut [NonStrict<T>; ARITY],
+        parent_idx: TreeIndex,
+        info: &SamplingInfo<T>,
+        cache_epoch: usize,
+    ) -> usize {
+        let start = TreeLayout::<ARITY>::child_index(parent_idx, 0).0;
+        let end = (start + ARITY).min(self.persistent.size.len());
+        let filled = end - start;
+
+        output_buffer[filled..].fill(NonStrict::zero());
+
+        for (offset, output) in output_buffer[..filled].iter_mut().enumerate() {
+            let child_idx = TreeIndex(start + offset);
+            if self.query_time.smoothed_mass_epoch[child_idx] != cache_epoch {
+                let mass = self.g(child_idx, info).0;
+                self.query_time.smoothed_mass[child_idx] = mass;
+                self.query_time.smoothed_mass_epoch[child_idx] = cache_epoch;
+            }
+            *output = self.query_time.smoothed_mass[child_idx];
+        }
+
+        filled
+    }
+
+    fn sample_index_impl(
         &mut self,
         info: &SamplingInfo<T>,
         rng: &mut impl rand::Rng,
-        fill: impl Fn(&Self, &mut [NonStrict<T>; ARITY], TreeIndex, &SamplingInfo<T>) -> usize,
-    ) -> Result<(V, TreeIndex, NonStrict<T>)> {
+        mut fill: impl FnMut(
+            &mut Self,
+            &mut [NonStrict<T>; ARITY],
+            TreeIndex,
+            &SamplingInfo<T>,
+        ) -> usize,
+    ) -> Result<(TreeIndex, NonStrict<T>)> {
         if self.persistent.size.is_empty() {
             return Err(anyhow!("Cannot sample from an empty tree."));
         }
@@ -232,7 +276,6 @@ where
         let mut prob =
             NonStrict::from_non_negative_scalar(T::ONE).expect("one must be non-negative");
         let mut buffer = [NonStrict::zero(); ARITY];
-        let mut cdf_buffer = [T::ZERO; ARITY];
 
         while self.persistent.size[cur].get() > 1 {
             // cur corresponds to an internal node
@@ -253,19 +296,18 @@ where
             let sample = T::from(rng.random::<f64>())
                 .expect("random f64 sample should convert to scalar")
                 * child_contribution_sum;
-            for (cdf, contribution) in cdf_buffer[..filled].iter_mut().zip(&buffer[..filled]) {
-                *cdf = contribution.into_scalar();
-            }
 
-            for i in 1..filled {
-                cdf_buffer[i] = cdf_buffer[i] + cdf_buffer[i - 1];
+            // Now we sample a child. ARITY is tiny, so a direct cumulative scan
+            // avoids maintaining a separate CDF buffer.
+            let mut cumulative = T::ZERO;
+            let mut child_idx = filled - 1;
+            for (idx, contribution) in buffer[..filled].iter().enumerate() {
+                cumulative = cumulative + contribution.into_scalar();
+                if cumulative >= sample {
+                    child_idx = idx;
+                    break;
+                }
             }
-
-            // Now we sample a child
-            let child_idx = cdf_buffer[..filled]
-                .iter()
-                .position(|&x| x >= sample)
-                .ok_or_else(|| anyhow!("Failed to sample a child node."))?;
             let prob_scalar =
                 prob.into_scalar() * buffer[child_idx].into_scalar() / child_contribution_sum;
             prob = NonStrict::from_non_negative_scalar(prob_scalar)
@@ -273,6 +315,16 @@ where
             cur = TreeLayout::<ARITY>::child_index(cur, child_idx);
         }
 
+        Ok((cur, prob))
+    }
+
+    fn sample_impl(
+        &mut self,
+        info: &SamplingInfo<T>,
+        rng: &mut impl rand::Rng,
+        fill: impl FnMut(&mut Self, &mut [NonStrict<T>; ARITY], TreeIndex, &SamplingInfo<T>) -> usize,
+    ) -> Result<(V, TreeIndex, NonStrict<T>)> {
+        let (cur, prob) = self.sample_index_impl(info, rng, fill)?;
         let node_id = self.tree_to_node_map.get(&cur).unwrap();
         Ok((*node_id, cur, prob))
     }
@@ -294,6 +346,27 @@ where
     ) -> Result<(V, TreeIndex, NonStrict<T>)> {
         self.sample_impl(info, rng, |this, buf, parent, info| {
             this.smoothed_contribution_from_arrays(buf, parent, info)
+        })
+    }
+
+    pub fn sample_smoothed_index(
+        &mut self,
+        info: &SamplingInfo<T>,
+        rng: &mut impl rand::Rng,
+    ) -> Result<(TreeIndex, NonStrict<T>)> {
+        self.sample_index_impl(info, rng, |this, buf, parent, info| {
+            this.smoothed_contribution_from_arrays(buf, parent, info)
+        })
+    }
+
+    pub fn sample_smoothed_index_cached(
+        &mut self,
+        info: &SamplingInfo<T>,
+        rng: &mut impl rand::Rng,
+        cache_epoch: usize,
+    ) -> Result<(TreeIndex, NonStrict<T>)> {
+        self.sample_index_impl(info, rng, |this, buf, parent, info| {
+            this.cached_smoothed_contribution_from_arrays(buf, parent, info, cache_epoch)
         })
     }
 

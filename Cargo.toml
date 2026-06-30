@@ -3,6 +3,7 @@ members = [
   "crates/raven-core",
   "crates/raven-adapters",
   "crates/raven",
+  "crates/raven-python",
 ]
 resolver = "3"
 
@@ -14,3 +15,4 @@ license = "Apache-2.0"
 [workspace.dependencies]
 raven-core = { path = "crates/raven-core" }
 raven-adapters = { path = "crates/raven-adapters" }
+raven = { path = "crates/raven" }

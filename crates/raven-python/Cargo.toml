@@ -1,0 +1,13 @@
+[package]
+name = "raven-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "raven_python"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["extension-module"] }
+raven.workspace = true

@@ -431,6 +431,32 @@ fn in_memory_index_interns_strings_queries_and_reuses_deleted_slots() {
 }
 
 #[test]
+fn in_memory_index_live_nodes_maps_external_ids_and_excludes_released_nodes() {
+    let mut index = InMemoryIndex::<2, String, f64>::new(test_identity_clustering());
+
+    index
+        .update_edge("alpha".to_string(), "beta".to_string(), Some(strict(1.0)))
+        .unwrap();
+    index
+        .update_edge("beta".to_string(), "gamma".to_string(), Some(strict(1.0)))
+        .unwrap();
+    index.apply_pending_node_ops().unwrap();
+
+    let mut live_nodes = index.live_nodes();
+    live_nodes.sort();
+    assert_eq!(live_nodes, vec!["alpha", "beta", "gamma"]);
+
+    index
+        .update_edge("alpha".to_string(), "beta".to_string(), None)
+        .unwrap();
+    index.apply_pending_node_ops().unwrap();
+
+    let mut live_nodes = index.live_nodes();
+    live_nodes.sort();
+    assert_eq!(live_nodes, vec!["beta", "gamma"]);
+}
+
+#[test]
 fn in_memory_index_delete_of_unknown_edge_does_not_intern_nodes() {
     let mut index = InMemoryIndex::<2, String, f64>::new(test_identity_clustering());
 
