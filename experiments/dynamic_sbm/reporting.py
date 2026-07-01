@@ -1,246 +1,11 @@
 from __future__ import annotations
 
-import argparse
 import csv
-import time
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from sklearn.metrics import adjusted_rand_score, average_precision_score, roc_auc_score
-from tqdm import tqdm
-
-import raven
-from in_memory_playground import (
-    balanced_query_pairs,
-    expected_edges_per_node,
-    prepare_diff_workload_sbm,
-    query_subset,
-)
-
-WORKLOAD_SEED = 42
-CORE_RNG_SEED = 42
-N_PER_CLUSTER = 1024
-NUM_CLUSTERS = 64
-TOTAL_NODES = N_PER_CLUSTER * NUM_CLUSTERS
-P_INTERNAL = 0.33
-Q_EXTERNAL = 1.0 / TOTAL_NODES
-N_MULTIPLIER = 2
-LIFETIME_MULTIPLIER = 1.0
-STEP_SIZE = 0.05
-SIGMA = 1000.0
-CORESET_SIZE = 2048
-SAMPLING_SEEDS = 256
-NUM_TRIALS = range(1, 20)
-QUERY_FRAC = 0.1
-DEGREE_REBUILD_THRESHOLD = 4096
-PAIR_COUNT = 100_000
-OUTPUT_DIR = Path("target/consensus_trials_playground")
-
-
-@dataclass(frozen=True)
-class PairBatch:
-    pairs: list[tuple[int, int]]
-    labels: list[bool]
-
-
-def main() -> None:
-    args = parse_args()
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    print_config(output_dir)
-    print("generating dynamic SBM workload...")
-    started = time.perf_counter()
-    workload = prepare_diff_workload_sbm(
-        seed=WORKLOAD_SEED,
-        n_per_cluster=N_PER_CLUSTER,
-        k_clusters=NUM_CLUSTERS,
-        p_internal=P_INTERNAL,
-        q_external=Q_EXTERNAL,
-        n_multiplier=N_MULTIPLIER,
-        lifetime_multiplier=LIFETIME_MULTIPLIER,
-        step_size=STEP_SIZE,
-    )
-    print(f"workload generation: {time.perf_counter() - started:.3f}s")
-
-    batches = workload.batches[: args.max_batches] if args.max_batches else workload.batches
-    trial_counts = list(NUM_TRIALS)
-    if args.max_trials:
-        trial_counts = trial_counts[: args.max_trials]
-
-    pair_cache: dict[int, PairBatch] = {}
-    per_batch_rows: list[dict[str, float | int]] = []
-
-    for num_trials in trial_counts:
-        print(f"replaying workload with num_trials={num_trials}...")
-        per_batch_rows.extend(
-            replay_trial_count(
-                num_trials,
-                batches,
-                workload.cluster_labels,
-                pair_cache,
-                no_progress=args.no_progress,
-            )
-        )
-
-    summary_rows = summarize(per_batch_rows)
-    write_csv(output_dir / "per_batch.csv", per_batch_rows)
-    write_csv(output_dir / "summary.csv", summary_rows)
-    write_report(
-        output_dir / "report.html",
-        per_batch_rows,
-        summary_rows,
-    )
-    write_plot_files(
-        output_dir / "plots",
-        per_batch_rows,
-        summary_rows,
-    )
-
-    print(f"wrote CSV: {output_dir / 'per_batch.csv'}")
-    print(f"wrote CSV: {output_dir / 'summary.csv'}")
-    print(f"wrote report: {output_dir / 'report.html'}")
-    print(f"wrote plot files: {output_dir / 'plots'}")
-
-
-def replay_trial_count(
-    num_trials: int,
-    batches,
-    cluster_labels: list[int],
-    pair_cache: dict[int, PairBatch],
-    *,
-    no_progress: bool,
-) -> list[dict[str, float | int]]:
-    index = raven.Raven(
-        NUM_CLUSTERS,
-        sigma=SIGMA,
-        coreset_size=CORESET_SIZE,
-        sampling_seeds=SAMPLING_SEEDS,
-        num_trials=num_trials,
-        rng_seed=CORE_RNG_SEED,
-        node_capacity=TOTAL_NODES,
-        expected_edges_per_node=expected_edges_per_node(
-            N_PER_CLUSTER, NUM_CLUSTERS, P_INTERNAL, Q_EXTERNAL
-        ),
-        degree_rebuild_threshold=DEGREE_REBUILD_THRESHOLD,
-    )
-
-    rows: list[dict[str, float | int]] = []
-    with tqdm(
-        total=sum(len(batch.edge_ops) for batch in batches),
-        disable=no_progress,
-        unit=" updates",
-    ) as pbar:
-        for batch_index, batch in enumerate(batches):
-            started = time.perf_counter()
-            index.update_edges(batch.edge_ops)
-            ingestion_s = time.perf_counter() - started
-
-            started = time.perf_counter()
-            index.flush()
-            flush_s = time.perf_counter() - started
-
-            live_nodes = index.live_nodes()
-            if len(live_nodes) < CORESET_SIZE:
-                pbar.update(len(batch.edge_ops))
-                pbar.set_postfix_str(
-                    f"trials={num_trials} batch={batch_index} live={len(live_nodes)} skipped"
-                )
-                continue
-
-            query_nodes = query_subset(
-                live_nodes,
-                frac=QUERY_FRAC,
-                min_size=NUM_CLUSTERS,
-                seed=WORKLOAD_SEED,
-            )
-            true_labels = [cluster_labels[node] for node in query_nodes]
-
-            started = time.perf_counter()
-            trials = index.query_all_trials(query_nodes)
-            query_s = time.perf_counter() - started
-
-            started = time.perf_counter()
-            consensus = raven.ConsensusResult.from_trials(query_nodes, trials)
-            consensus_build_s = time.perf_counter() - started
-
-            pair_batch = pair_cache.get(batch_index)
-            if pair_batch is None:
-                pair_batch = build_pair_batch(
-                    batch_index,
-                    query_nodes,
-                    cluster_labels,
-                )
-                pair_cache[batch_index] = pair_batch
-
-            started = time.perf_counter()
-            pair_scores = consensus.score_pairs(pair_batch.pairs)
-            pair_score_s = time.perf_counter() - started
-
-            winner_ari, winner_score, winner_k = winner_summary(true_labels, trials)
-            pair_auc = float(roc_auc_score(pair_batch.labels, pair_scores))
-            pair_ap = float(average_precision_score(pair_batch.labels, pair_scores))
-
-            rows.append(
-                {
-                    "num_trials": num_trials,
-                    "batch_index": batch_index,
-                    "batch_time": batch.time,
-                    "live_nodes": len(live_nodes),
-                    "query_nodes": len(query_nodes),
-                    "edge_ops": len(batch.edge_ops),
-                    "ingestion_s": ingestion_s,
-                    "flush_s": flush_s,
-                    "query_s": query_s,
-                    "consensus_build_s": consensus_build_s,
-                    "pair_score_s": pair_score_s,
-                    "pair_count": len(pair_batch.pairs),
-                    "winner_ari": winner_ari,
-                    "winner_score": winner_score,
-                    "winner_num_clusters": winner_k,
-                    "pair_roc_auc": pair_auc,
-                    "pair_average_precision": pair_ap,
-                }
-            )
-
-            pbar.update(len(batch.edge_ops))
-            pbar.set_postfix_str(
-                f"trials={num_trials} batch={batch_index} "
-                f"q={len(query_nodes)} query={query_s * 1000:.1f}ms "
-                f"pairs={pair_score_s * 1000:.1f}ms auc={pair_auc:.3f}"
-            )
-
-    return rows
-
-
-def build_pair_batch(
-    batch_index: int,
-    query_nodes: list[int],
-    cluster_labels: list[int],
-) -> PairBatch:
-    rng = np.random.default_rng(WORKLOAD_SEED + batch_index + 1_000_003)
-    pairs, labels = balanced_query_pairs(
-        query_nodes,
-        cluster_labels,
-        PAIR_COUNT,
-        rng=rng,
-    )
-    return PairBatch(pairs=pairs, labels=labels)
-
-
-def winner_summary(true_labels: list[int], trials) -> tuple[float, float, int]:
-    summaries = [
-        (
-            float(adjusted_rand_score(true_labels, trial.labels)),
-            float(np.sum(trial.scores)) if trial.scores is not None else float(trial.trial_index),
-            int(trial.num_clusters),
-        )
-        for trial in trials
-    ]
-    return min(summaries, key=lambda item: item[1])
 
 
 def summarize(rows: list[dict[str, float | int]]) -> list[dict[str, float | int]]:
@@ -256,10 +21,8 @@ def summarize(rows: list[dict[str, float | int]]) -> list[dict[str, float | int]
                 "total_ingestion_s": total(trial_rows, "ingestion_s"),
                 "total_flush_s": total(trial_rows, "flush_s"),
                 "total_query_s": total(trial_rows, "query_s"),
-                "total_consensus_build_s": total(trial_rows, "consensus_build_s"),
                 "total_pair_score_s": total(trial_rows, "pair_score_s"),
                 "mean_query_ms": mean_ms(trial_rows, "query_s"),
-                "mean_consensus_build_ms": mean_ms(trial_rows, "consensus_build_s"),
                 "mean_pair_score_ms": mean_ms(trial_rows, "pair_score_s"),
                 "mean_pair_us": mean_pair_us(trial_rows),
                 "mean_winner_ari": mean(trial_rows, "winner_ari"),
@@ -296,18 +59,18 @@ def write_report(
             [{"type": "surface"}],
             [{"type": "surface"}],
             [{"type": "surface"}],
-            [{"type": "xy"}],
+            [{"type": "surface"}],
             [{"type": "xy"}],
             [{"type": "xy"}],
         ],
-        row_heights=[0.19, 0.19, 0.19, 0.14, 0.14, 0.15],
-        vertical_spacing=0.08,
+        row_heights=[0.17, 0.17, 0.17, 0.17, 0.15, 0.17],
+        vertical_spacing=0.07,
         subplot_titles=[
             "Pair ROC-AUC Surface",
+            "Winner ARI Surface",
             "Query Time Surface",
             "Total Decision Time Surface",
             "Mean Time vs Trials",
-            "Pair Metrics and Winner ARI vs Trials",
             f"Early Pair Metrics vs Trials ({early_label})",
         ],
     )
@@ -316,18 +79,17 @@ def write_report(
         per_batch_rows,
         lambda row: float(row["pair_roc_auc"]),
     )
+    _, _, winner_ari_z = surface_grid(
+        per_batch_rows,
+        lambda row: float(row["winner_ari"]),
+    )
     _, _, query_z = surface_grid(
         per_batch_rows,
         lambda row: float(row["query_s"]) * 1000.0,
     )
     _, _, total_decision_z = surface_grid(
         per_batch_rows,
-        lambda row: (
-            float(row["query_s"])
-            + float(row["consensus_build_s"])
-            + float(row["pair_score_s"])
-        )
-        * 1000.0,
+        lambda row: (float(row["query_s"]) + float(row["pair_score_s"])) * 1000.0,
     )
 
     add_surface(
@@ -337,8 +99,19 @@ def write_report(
         auc_z,
         "ROC-AUC",
         colorbar_x=1.02,
-        colorbar_y=0.92,
+        colorbar_y=0.935,
         row=1,
+        col=1,
+    )
+    add_surface(
+        fig,
+        batch_times,
+        trial_counts,
+        winner_ari_z,
+        "winner ARI",
+        colorbar_x=1.02,
+        colorbar_y=0.79,
+        row=2,
         col=1,
     )
     add_surface(
@@ -348,8 +121,8 @@ def write_report(
         query_z,
         "query ms",
         colorbar_x=1.02,
-        colorbar_y=0.72,
-        row=2,
+        colorbar_y=0.645,
+        row=3,
         col=1,
     )
     add_surface(
@@ -359,8 +132,8 @@ def write_report(
         total_decision_z,
         "total ms",
         colorbar_x=1.02,
-        colorbar_y=0.52,
-        row=3,
+        colorbar_y=0.50,
+        row=4,
         col=1,
     )
 
@@ -373,34 +146,21 @@ def write_report(
             name="query",
             hovertemplate="trials=%{x}<br>ms=%{y:.2f}<extra>%{fullData.name}</extra>",
         ),
-        row=4,
+        row=5,
         col=1,
     )
     fig.add_trace(
         go.Scatter(
             x=x_summary,
             y=[
-                float(row["mean_query_ms"])
-                + float(row["mean_consensus_build_ms"])
-                + float(row["mean_pair_score_ms"])
+                float(row["mean_query_ms"]) + float(row["mean_pair_score_ms"])
                 for row in summary_rows
             ],
             mode="lines+markers",
             name="total decision",
             hovertemplate="trials=%{x}<br>ms=%{y:.2f}<extra>%{fullData.name}</extra>",
         ),
-        row=4,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x_summary,
-            y=[float(row["mean_consensus_build_ms"]) for row in summary_rows],
-            mode="lines+markers",
-            name="consensus build",
-            hovertemplate="trials=%{x}<br>ms=%{y:.2f}<extra>%{fullData.name}</extra>",
-        ),
-        row=4,
+        row=5,
         col=1,
     )
     fig.add_trace(
@@ -411,43 +171,9 @@ def write_report(
             name="100k pair scoring",
             hovertemplate="trials=%{x}<br>ms=%{y:.2f}<extra>%{fullData.name}</extra>",
         ),
-        row=4,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x_summary,
-            y=[float(row["mean_pair_roc_auc"]) for row in summary_rows],
-            mode="lines+markers",
-            name="ROC-AUC",
-            hovertemplate="trials=%{x}<br>score=%{y:.3f}<extra>%{fullData.name}</extra>",
-        ),
         row=5,
         col=1,
     )
-    fig.add_trace(
-        go.Scatter(
-            x=x_summary,
-            y=[float(row["mean_pair_average_precision"]) for row in summary_rows],
-            mode="lines+markers",
-            name="average precision",
-            hovertemplate="trials=%{x}<br>score=%{y:.3f}<extra>%{fullData.name}</extra>",
-        ),
-        row=5,
-        col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x_summary,
-            y=[float(row["mean_winner_ari"]) for row in summary_rows],
-            mode="lines+markers",
-            name="winner ARI",
-            hovertemplate="trials=%{x}<br>score=%{y:.3f}<extra>%{fullData.name}</extra>",
-        ),
-        row=5,
-        col=1,
-    )
-
     early_rows = [
         row for row in per_batch_rows if int(row["batch_index"]) in early_batches
     ]
@@ -475,17 +201,12 @@ def write_report(
         col=1,
     )
 
-    fig.update_xaxes(title_text="num_trials", row=4, col=1)
     fig.update_xaxes(title_text="num_trials", row=5, col=1)
     fig.update_xaxes(title_text="num_trials", row=6, col=1)
-    fig.update_yaxes(title_text="ms", tickformat=".2f", row=4, col=1)
-    fig.update_yaxes(title_text="score", tickformat=".3f", row=5, col=1)
+    fig.update_yaxes(title_text="ms", tickformat=".2f", row=5, col=1)
     fig.update_yaxes(title_text="score", tickformat=".3f", row=6, col=1)
     fig.update_layout(
-        title=(
-            "Raven Consensus Trial Scaling"
-            f"<br><sup>Early = {early_label}</sup>"
-        ),
+        title=("Raven Consensus Trial Scaling" f"<br><sup>Early = {early_label}</sup>"),
         height=4200,
         legend_title="series",
         legend={
@@ -497,8 +218,9 @@ def write_report(
         },
         margin={"r": 130, "b": 130, "t": 110},
         scene=surface_scene("batch time", "num_trials", "ROC-AUC"),
-        scene2=surface_scene("batch time", "num_trials", "query ms"),
-        scene3=surface_scene("batch time", "num_trials", "total ms"),
+        scene2=surface_scene("batch time", "num_trials", "winner ARI"),
+        scene3=surface_scene("batch time", "num_trials", "query ms"),
+        scene4=surface_scene("batch time", "num_trials", "total ms"),
     )
     fig.write_html(path)
 
@@ -521,18 +243,17 @@ def write_plot_files(
         per_batch_rows,
         lambda row: float(row["pair_roc_auc"]),
     )
+    _, _, winner_ari_z = surface_grid(
+        per_batch_rows,
+        lambda row: float(row["winner_ari"]),
+    )
     _, _, query_z = surface_grid(
         per_batch_rows,
         lambda row: float(row["query_s"]) * 1000.0,
     )
     _, _, total_decision_z = surface_grid(
         per_batch_rows,
-        lambda row: (
-            float(row["query_s"])
-            + float(row["consensus_build_s"])
-            + float(row["pair_score_s"])
-        )
-        * 1000.0,
+        lambda row: (float(row["query_s"]) + float(row["pair_score_s"])) * 1000.0,
     )
 
     plots = [
@@ -545,6 +266,17 @@ def write_plot_files(
                 trial_counts,
                 auc_z,
                 "ROC-AUC",
+            ),
+        ),
+        (
+            "winner_ari_surface.html",
+            "Winner ARI Surface",
+            standalone_surface_figure(
+                "Winner ARI Surface",
+                batch_times,
+                trial_counts,
+                winner_ari_z,
+                "winner ARI",
             ),
         ),
         (
@@ -573,11 +305,6 @@ def write_plot_files(
             "mean_time_vs_trials.html",
             "Mean Time vs Trials",
             mean_time_figure(summary_rows),
-        ),
-        (
-            "pair_metrics_winner_ari.html",
-            "Pair Metrics and Winner ARI vs Trials",
-            pair_metrics_figure(summary_rows),
         ),
         (
             "early_pair_metrics.html",
@@ -634,22 +361,11 @@ def mean_time_figure(summary_rows: list[dict[str, float | int]]) -> go.Figure:
         go.Scatter(
             x=x_summary,
             y=[
-                float(row["mean_query_ms"])
-                + float(row["mean_consensus_build_ms"])
-                + float(row["mean_pair_score_ms"])
+                float(row["mean_query_ms"]) + float(row["mean_pair_score_ms"])
                 for row in summary_rows
             ],
             mode="lines+markers",
             name="total decision",
-            hovertemplate="trials=%{x}<br>ms=%{y:.2f}<extra>%{fullData.name}</extra>",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x_summary,
-            y=[float(row["mean_consensus_build_ms"]) for row in summary_rows],
-            mode="lines+markers",
-            name="consensus build",
             hovertemplate="trials=%{x}<br>ms=%{y:.2f}<extra>%{fullData.name}</extra>",
         )
     )
@@ -663,34 +379,6 @@ def mean_time_figure(summary_rows: list[dict[str, float | int]]) -> go.Figure:
         )
     )
     style_line_figure(fig, "Mean Time vs Trials", "ms")
-    return fig
-
-
-def pair_metrics_figure(summary_rows: list[dict[str, float | int]]) -> go.Figure:
-    x_summary = [int(row["num_trials"]) for row in summary_rows]
-    fig = go.Figure()
-    fig.add_trace(
-        score_trace(
-            x_summary,
-            [float(row["mean_pair_roc_auc"]) for row in summary_rows],
-            "ROC-AUC",
-        )
-    )
-    fig.add_trace(
-        score_trace(
-            x_summary,
-            [float(row["mean_pair_average_precision"]) for row in summary_rows],
-            "average precision",
-        )
-    )
-    fig.add_trace(
-        score_trace(
-            x_summary,
-            [float(row["mean_winner_ari"]) for row in summary_rows],
-            "winner ARI",
-        )
-    )
-    style_line_figure(fig, "Pair Metrics and Winner ARI vs Trials", "score")
     return fig
 
 
@@ -749,7 +437,7 @@ def write_plot_index(output_dir: Path, plots: list[tuple[str, str]]) -> None:
             [
                 "<!doctype html>",
                 "<html>",
-                "<head><meta charset=\"utf-8\"><title>Raven Consensus Plots</title></head>",
+                '<head><meta charset="utf-8"><title>Raven Consensus Plots</title></head>',
                 "<body>",
                 "<h1>Raven Consensus Trial Scaling</h1>",
                 "<ul>",
@@ -886,51 +574,6 @@ def early_batch_label(
     return f"{batch_text}; first {pct:.0f}% where 1-trial AUC < 0.98"
 
 
-def print_config(output_dir: Path) -> None:
-    rows = {
-        "nodes": TOTAL_NODES,
-        "clusters": NUM_CLUSTERS,
-        "n_per_cluster": N_PER_CLUSTER,
-        "p_internal": P_INTERNAL,
-        "q_external": Q_EXTERNAL,
-        "n_multiplier": N_MULTIPLIER,
-        "lifetime_multiplier": LIFETIME_MULTIPLIER,
-        "step_size": STEP_SIZE,
-        "sigma": SIGMA,
-        "coreset_size": CORESET_SIZE,
-        "sampling_seeds": SAMPLING_SEEDS,
-        "num_trials": "1..10",
-        "query_frac": QUERY_FRAC,
-        "expected_edges_per_node": expected_edges_per_node(
-            N_PER_CLUSTER, NUM_CLUSTERS, P_INTERNAL, Q_EXTERNAL
-        ),
-        "degree_rebuild_threshold": DEGREE_REBUILD_THRESHOLD,
-        "pair_count": PAIR_COUNT,
-        "output_dir": output_dir,
-        "workload_seed": WORKLOAD_SEED,
-        "core_rng_seed": CORE_RNG_SEED,
-    }
-    print("Config:")
-    for key, value in rows.items():
-        print(f"  {key}: {value}")
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Measure Raven query and consensus scaling for num_trials=1..10."
-    )
-    parser.add_argument("--output-dir", default=str(OUTPUT_DIR))
-    parser.add_argument("--max-trials", type=int, default=None)
-    parser.add_argument("--max-batches", type=int, default=None)
-    parser.add_argument("--no-progress", action="store_true")
-    args = parser.parse_args()
-    if args.max_trials is not None and not 1 <= args.max_trials <= 10:
-        parser.error("--max-trials must be between 1 and 10")
-    if args.max_batches is not None and args.max_batches <= 0:
-        parser.error("--max-batches must be positive")
-    return args
-
-
 def total(rows: list[dict[str, float | int]], field: str) -> float:
     return float(sum(float(row[field]) for row in rows))
 
@@ -952,11 +595,3 @@ def mean_pair_us(rows: list[dict[str, float | int]]) -> float:
             ]
         )
     )
-
-
-def ms(rows: list[dict[str, float | int]], field: str) -> list[float]:
-    return [float(row[field]) * 1000.0 for row in rows]
-
-
-if __name__ == "__main__":
-    main()

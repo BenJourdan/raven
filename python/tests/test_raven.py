@@ -96,20 +96,22 @@ def test_query_consensus_lazy_pair_probabilities():
     assert consensus.nodes == [1, 2, 3]
     assert consensus.num_trials == 3
     assert consensus.num_nodes == 3
-    assert consensus.labels.shape == (3, 3)
-    assert consensus.trial_weights.tolist() == pytest.approx([1 / 3, 1 / 3, 1 / 3])
+    assert len(consensus.labels) == 3
+    assert len(consensus.labels[0]) == 3
+    assert consensus.trial_weights == pytest.approx([1 / 3, 1 / 3, 1 / 3])
 
     probability = consensus.score_pair(1, 2)
     assert 0.0 <= probability <= 1.0
 
     probabilities = consensus.score_pairs([(1, 2), (1, 3)])
-    assert probabilities.shape == (2,)
+    assert len(probabilities) == 2
     assert all(0.0 <= value <= 1.0 for value in probabilities)
 
     matrix = consensus.score_matrix([1, 2])
-    assert matrix.shape == (2, 2)
-    assert matrix[0, 0] == pytest.approx(1.0)
-    assert matrix[1, 1] == pytest.approx(1.0)
+    assert len(matrix) == 2
+    assert len(matrix[0]) == 2
+    assert matrix[0][0] == pytest.approx(1.0)
+    assert matrix[1][1] == pytest.approx(1.0)
 
     assert len(consensus.threshold_pairs([(1, 2), (2, 3)], threshold=0.0)) == 2
     assert consensus.connected_components(
@@ -118,8 +120,34 @@ def test_query_consensus_lazy_pair_probabilities():
         include_singletons=False,
     ) == [[1, 2, 3]]
 
-    with pytest.raises(KeyError):
+    with pytest.raises(raven.RavenError):
         consensus.score_pair(1, 99)
+
+
+def test_direct_score_pairs_matches_consensus_result():
+    kwargs = {
+        "coreset_size": 3,
+        "sampling_seeds": 2,
+        "num_trials": 3,
+        "rng_seed": 42,
+        "node_capacity": 16,
+        "expected_edges_per_node": 4,
+    }
+    direct_index = raven.Raven(2, **kwargs)
+    consensus_index = raven.Raven(2, **kwargs)
+    populate(direct_index)
+    populate(consensus_index)
+
+    pairs = [(1, 2), (1, 3), (2, 2)]
+    direct_scores = direct_index.score_pairs(pairs, trial_weighting="uniform")
+    consensus = consensus_index.query_consensus(
+        [1, 2, 3],
+        trial_weighting="uniform",
+    )
+
+    assert direct_scores == pytest.approx(consensus.score_pairs(pairs))
+    score = direct_index.score_pair(1, 2, trial_weighting="uniform")
+    assert 0.0 <= score <= 1.0
 
 
 def test_errors_are_raven_errors():
